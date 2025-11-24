@@ -33,3 +33,16 @@ export SPLIT_FILE="data/qm9/splits.json"
 python scripts/preprocess_qm9.py --target_dir $TARGET_DIR --split_file $SPLIT_FILE
 ```
 
+### Launching a training run
+
+By default, the example config expects the env variables `DATA_PATH` and `LOG_PATH` to be defined.
+
+```
+export DATA_PATH="data/qm9" # location of the pre-processed data
+export LOG_PATH="path/to/where/to/save/logs-and-checkpoints"
+
+export CONFIG_NAME="train_qm9_sp" # without .yaml extension
+
+python src_gmmm/train.py -cn $CONFIG_NAME
+```
+
