@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch_scatter import scatter_sum
 
 from ..nn.layers import EdgeEmbedding, EquivLayerNorm, FourierEmbedding
+from ..nn.layers import SelfConditioningResidualLayer #self-conditioning
 
 
 class InteractionLayer(nn.Module):
@@ -136,6 +137,7 @@ class EquivEncoder(nn.Module):
         num_layers: int = 4,
         h_input_dim: int = 100,
         smooth_h: bool = True,
+        self_conditioning: bool = False, #self-conditioning
     ):
         super(EquivEncoder, self).__init__()
 
@@ -173,6 +175,14 @@ class EquivEncoder(nn.Module):
             [UpdateLayer(hidden_dim) for _ in range(num_layers)]
         )
 
+        #self-conditioning #TODO: add h-dim for h-conditioning
+        self.self_conditioning = self_conditioning
+        if self_conditioning:
+            self.sc_layer = SelfConditioningResidualLayer(
+                node_dim = hidden_dim, 
+                edge_dim = edge_embedding.out_features
+            )
+
     def forward(
         self,
         t: torch.Tensor,
@@ -180,6 +190,7 @@ class EquivEncoder(nn.Module):
         pos: torch.Tensor,
         node_index: torch.Tensor,
         edge_node_index: Optional[torch.Tensor],
+        prev_preds: dict[torch.Tensor, torch.Tensor] = None, #self-conditioning previous predictions
     ) -> dict[str, torch.Tensor]:
 
         t = self.time_embedding(t)
@@ -193,6 +204,17 @@ class EquivEncoder(nn.Module):
         edge_states, unit_vectors = self.edge_embedding.forward(
             positions=pos, edge_index=edge_node_index
         )
+
+        #self-conditioning: update node and edge states with previous predictions. Done BEFORE interaction and update layers.
+        if self.self_conditioning and prev_preds is not None:
+            node_states_s, edge_states = self.sc_layer.forward(
+                node_states_s = node_states_s,
+                edge_states = edge_states, 
+                pos = pos, 
+                prev_preds = prev_preds, 
+                node_index = node_index, 
+                edge_node_index = edge_node_index
+            )
 
         for (
             interaction,

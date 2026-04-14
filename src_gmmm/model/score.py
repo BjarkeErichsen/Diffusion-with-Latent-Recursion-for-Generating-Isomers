@@ -22,6 +22,7 @@ class EquivariantParameterization(nn.Module):
         pos: torch.Tensor,
         node_index: torch.Tensor,
         edge_node_index: torch.Tensor,
+        prev_preds = None #self-conditioning: previous predictions
     ):
         states = self.encoder.forward(
             t=t,
@@ -29,6 +30,7 @@ class EquivariantParameterization(nn.Module):
             pos=pos,
             node_index=node_index,
             edge_node_index=edge_node_index,
+            prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
         )
         return self.readout.forward(
             t,

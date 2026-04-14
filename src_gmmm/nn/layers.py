@@ -174,3 +174,57 @@ class EquivLayerNorm(nn.Module):
         out = sout, vout
 
         return out
+
+
+#self-conditioning: residual layer that takes previous predictions as input
+class SelfConditioningResidualLayer(nn.Module):
+    def __init__(self, node_dim: int, edge_dim: int):
+        super().__init__()
+
+        self.node_mlp = nn.Sequential(
+            nn.Linear(node_dim + 1, node_dim),
+            nn.SiLU(),
+            nn.Linear(node_dim, node_dim) 
+            )
+
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(edge_dim + 1, edge_dim),
+            nn.SiLU(),
+            nn.Linear(edge_dim, edge_dim)
+        )
+
+
+    def forward(self, node_states_s, edge_states, pos , prev_preds, node_index, edge_node_index):
+        prev_pos = prev_preds["pos"]
+        #prev_h = prev_preds["h"] #TODO: add this back when we start using diffusion_h
+
+        #Nodoes s
+        # difference of positions of the same atoms in X_t and X_1 #strategy used by both FlowMol and Harmonic
+        node_dist = torch.norm(pos - prev_pos, dim=-1, keepdim=True) 
+
+        #concat current node state, hte predicted h node states and the predicted distance
+        node_resid_input = torch.cat([node_states_s, node_dist], dim=-1) #TODO: add prev_h when we start using diffusion_h
+        node_states_s = node_states_s + self.node_mlp(node_resid_input) #map back to dim of s 
+
+        #TODO: Maybe add self-conditioning for node states v as well?
+
+        #Edges e
+        src, dst = edge_node_index
+        
+        #eucledian length of edges in X_t
+        curr_edge_dist = torch.norm(pos[src] - pos[dst], dim=-1, keepdim=True)
+         
+        #eucledian length of edges in X_1 
+        prev_edge_dist = torch.norm(prev_pos[src] - prev_pos[dst], dim=-1, keepdim=True)
+        
+        #difference in edge lengths of X_1 and X_t
+        edge_dist_diff = prev_edge_dist - curr_edge_dist 
+
+        #MLP(concat(edge_states, edge_dist_diff)) + edge states
+        edge_resid_input = torch.cat([edge_states, edge_dist_diff], dim=-1)
+        edge_states = edge_states + self.edge_mlp(edge_resid_input)
+
+        return node_states_s, edge_states
+
+        
+

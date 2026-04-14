@@ -1,4 +1,4 @@
-from typing import Literal, Optional, Union
+from typing import Literal, Optional, Union, Dict
 
 import torch
 import torch.nn as nn
@@ -14,20 +14,37 @@ class EquivariantDiffusion(nn.Module):
         parameterization: EquivariantParameterization,
         diffusion_pos: Optional[ContinuousDiffusion],
         diffusion_h: Optional[ContinuousDiffusion],
+        self_conditioning: bool = False, #self-conditioning: whether to use self-conditioning
+        scprop: float = 0.9,  #self-conditioning: probability of using self-conditioning
     ):
         super().__init__()
 
         self.parameterization = parameterization
         self.diffusions = nn.ModuleDict({"pos": diffusion_pos, "h": diffusion_h})
 
+        self.self_conditioning = self_conditioning #self-conditioning: whether to use self-conditioning
+        self.scprop = scprop #self-conditioning: probability of using self-conditioning
+
     def loss_diffusion(self, t: torch.Tensor, batch: Batch | Data):
         latents, targets = self.training_targets(t=t, batch=batch)
-
+        
+        #self-conditioning: run an inference step without backprop to get previous predictions
+        prev_preds = None 
+        if self.self_conditioning and torch.rand(1) < self.scprop:
+            with torch.no_grad():
+                prev_preds = self.parameterization.forward(
+                    t=t,
+                    **latents,
+                    node_index=batch.batch,
+                    edge_node_index=batch.edge_node_index,
+                )
+        
         preds = self.parameterization.forward(
             t=t,
             **latents,
             node_index=batch.batch,
             edge_node_index=batch.edge_node_index,
+            prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
         )
 
         losses = {}
@@ -121,6 +138,9 @@ class EquivariantDiffusion(nn.Module):
                 "pos": [pos_t],
                 "h": [h_t],
             }
+        
+        
+        prev_preds = None  #self-conditioning: previous predictions
 
         for i in range(n_steps):
             t = ts[i]
@@ -128,14 +148,16 @@ class EquivariantDiffusion(nn.Module):
 
             t = torch.full((num_graphs, 1), t, device=device)
 
+            #self-conditioning: update previous predictions
             if method == "em":
-                pos_t, h_t = self.reverse_step_em(
+                pos_t, h_t, prev_preds = self.reverse_step_em( 
                     t=t,
                     dt=dt,
                     pos_t=pos_t,
                     h_t=h_t,
                     node_index=node_index,
                     edge_node_index=edge_node_index,
+                    prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
                 )
 
             if return_traj:
@@ -161,6 +183,7 @@ class EquivariantDiffusion(nn.Module):
         h_t: torch.Tensor,
         node_index: torch.Tensor,
         edge_node_index: torch.Tensor,
+        prev_preds: Optional[dict[torch.Tensor, torch.Tensor]] = None #self-conditioning: previous predictions
     ):
 
         # get NN predictions
@@ -170,6 +193,7 @@ class EquivariantDiffusion(nn.Module):
             h=h_t,
             node_index=node_index,
             edge_node_index=edge_node_index,
+            prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
         )
         # reverse step on each modality
         if self.diffusion_pos:
@@ -182,7 +206,7 @@ class EquivariantDiffusion(nn.Module):
                 t=t[node_index], x_t=h_t, pred=preds["h"], dt=dt, index=node_index
             )
 
-        return pos_t, h_t
+        return pos_t, h_t, preds #self-conditioning: return predictions
 
     @property
     def diffusion_pos(self) -> Optional[ContinuousDiffusion]:
