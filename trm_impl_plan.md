@@ -1,0 +1,432 @@
+# TRM_g3m Latent Recursion Pipeline Implementation Plan
+
+This document details the planned changes needed to incorporate a TRM-like latent recursion structure into the `g3m` model. This runs in addition to (and independently of) the existing self-conditioning mechanism.
+
+## Concept: Latent Recursion and "Z" Matrix Prediction
+
+The core objective is to introduce an additional iterative processing mechanism where the model predicts and refines a global latent scratchpad "Z" alongside standard endpoints.
+
+### 1. The "Z" Matrix Scratchpad
+The model will predict an additional latent variable $Z$. At the start, this will be a single latent matrix for the whole graph. $Z$ is used as an input to the message passing layers.
+
+*Architecture of the Forward Pass:*
+```python
+z_next, x1 = model(xt, t, x1, z_prev)
+```
+Where `z_prev` is the model's previous prediction of $Z$.
+
+### 2. Control Parameters
+To govern this process, we introduce the following structural parameters:
+- `latent_recursion` (boolean): Controls whether we execute latent recursion at all (similar to self-conditioning in `train_qm9_sp.yaml`).
+- `M x z_dim`: The dimensions of the latent scratchpad. $M$ is an arbitrary size (not necessarily the number of atoms), and $z\_dim$ is the latent dimension size. So $Z \in \mathbb{R}^{M \times z\_dim}$.
+- `n` (int, default = 1): **Latent Recursion Steps**. The number of times we predict and update $Z$ *before* denoising/updating $x_1$. Backpropagation occurs through *all* $n$ steps. Note: $x_1$ is *not* updated during these steps; we predict a new version but don't feed it forward. If $n=0$, there is no extra latent recursion, only a single pass predicting both $z_{next}$ and $x_1$.
+- `K` (int, default = 2): **Deep Recursion Steps**. The number of times the latent recursions are repeated. $K=2$ implies 1 round of latent recursion without backprop starting from a "none" value of $x_1$, followed by 1 round of latent recursion with backprop starting from the predicted value of $x_1$.
+
+### 3. Training Strategy
+During training, we manage both $K$ (Deep Recursion) and $n$ (Latent Recursion).
+
+*Pseudo-code:*
+```python
+for k in range(K):  # Deep recursion (e.g., K=2, backprop ONLY on the LAST iteration)
+    for i in range(n):  # Latent recursion (e.g., n=1, backprop through ALL recursion steps)
+        z_next, _ = model(xt, t, x1, z_prev)
+        z_prev = z_next
+    
+    # Final pass to get predicted x1
+    z_next, x1 = model(xt, t, x1, z_prev)
+    z_prev = z_next
+    
+    if k < K - 1:  
+        # Only backpropagate if we are on the last deep recursion step.
+        # Otherwise, detach to prevent tracking gradients through early approximations.
+        z_prev = z_next.detach()
+        x1 = x1.detach()
+```
+*Note:* We backpropagate through steps where we update $Z$. This allows the model to learn how to actively "design" $Z$ for better denoising. $x_1$ is not backpropagated through; we only use the deep recursion step to get a strong approximation of how the final $x_1$ will look during inference.
+
+### 4. Inference Strategy
+During inference, we don't execute deep recursion ($K$), only latent recursion ($n$). This is because we inherently maintain the most refined history.
+
+*Pseudo-code:*
+```python
+for i in range(n):  # Latent recursion
+    z_next, _ = model(xt, t, x1, z_prev)
+    z_prev = z_next
+
+# Final unified pass
+z_next, x1 = model(xt, t, x1, z_prev)
+z_prev = z_next
+```
+
+---
+
+
+
+
+
+
+
+
+## Architecture and Implementation Details
+
+The following outlines the core areas of the codebase that must be modified to support this design.
+
+### 3.1: Self-Conditioning Implementation Extension
+The $x_1$ prediction logic is already partially represented in the model's self-conditioning logic. Currently, there is an "implicit" $K=2$ parameter hardcoded in `model/diffusion.py`.
+
+*Relevant existing code:*
+```python
+#self-conditioning: run an inference step without backprop to get previous predictions
+prev_preds = None 
+if self.self_conditioning and torch.rand(1) < self.scprop:
+    with torch.no_grad():
+        prev_preds = self.parameterization.forward(
+            t=t,
+            **latents,
+            node_index=batch.batch,
+            edge_node_index=batch.edge_node_index,
+        )
+```
+**ADD TO PLAN:** Modify this code logic to formally include loops matching the training structure above (assuming $K \ge 2$ and $n \ge 0$).
+
+### 3.2: Latent Recursion in Training and Inference
+We need to update the forward pass of the diffusion model wrapper to natively track and execute latent recursion steps. This includes wiring the $n$ (latent recursion steps) and $K$ (deep recursion steps) parameters correctly into the core loop.
+
+### 3.3: How do we use z, update z, and initialize z?
+
+#### 1. State & Initialization
+* **Dimensions:** Scalar $s \in \mathbb{R}^{N \times F}$, Vector $v \in \mathbb{R}^{N \times F \times 3}$, Latent $Z \in \mathbb{R}^{M \times z\_dim}$.
+* **Initialization:** $Z_{base}$ is a static nn.Parameter. At step $n=0$, expand it across the batch dimension to create $Z_{prev}$.
+
+#### 2. The $s$-Only Execution Flow
+* **Phase 1: Pre-Message Passing Primer (Layer 0)**
+    * **Action:** Nodes read from the global plan before local message passing starts.
+    * **Update:** 
+        * $s_{new} = s + \text{ZeroInitMLP}(\text{CrossAttn}(Q=s, K=Z_{prev}, V=Z_{prev}))$
+        * $v_{new} = v$ (Strict Bypass)
+* **Phase 2: The Latent Sync Module (Inside the $L$-layer loop)**
+    * *Executes immediately after the local UpdateLayer.*
+    * **Read ($Z \leftarrow s$):** 
+        * $s$ is converted to a dense representation and $Z$ cross-attends to it.
+        * $Z_{new} = Z_{old} + \text{ZeroInitMLP}(\text{CrossAttn}(Q=Z_{old}, K=s_{dense}, V=s_{dense}))$
+    * **Compute ($Z \leftrightarrow Z$):**
+        * *Standard `nn.TransformerEncoderLayer` with batch_first=True, norm_first=True.*
+        * $Z_{proc} = \text{TransformerEncoderLayer}(Z_{new})$
+    * **Write ($s \leftarrow Z$):**
+        * *Context from $Z$ is written back to the dense representation.*
+        * $s_{new\_dense} = s_{dense} + \text{ZeroInitLinear}(\text{CrossAttn}(Q=s_{dense}, K=Z_{proc}, V=Z_{proc}))$
+        * $s_{new} = s_{new\_dense}[\text{mask}]$ (convert back to sparse)
+        * $v_{new} = v$ (Strict Bypass)
+* **Phase 3: Latent Readout**
+    * **Action:** Pass the final state back to the diffusion loop for recursion step $n$.
+    * **Update:** $Z_{next} = Z_{prev} + \text{ZeroInitLinear}(Z_{proc})$.
+
+---
+
+## 4. The Action Plan
+*(Do not write any code yourself, ONLY ADD TO THE PLAN.)*
+
+Below this section, add to the plan, matching the exact style of the implementation plan seen in `self_conditioning_impl_plan.md` (using `[EXISTING CODE]` and `[NEW CODE]` block formatting mapping files and specific line injections). It should reference the code, relevant file, and how you think it should be changed. Here we want to match the description I added.
+
+---
+
+### Phase 1: Configuration Updates
+
+**Target File:** `config/train_qm9_sp.yaml` (Assuming standard hydra layout)  
+**Action:** Add the structural parameters to cleanly control the recursion mechanisms and dimension logic.
+
+```yaml
+# [NEW CODE] - Add to model arguments
+latent_recursion: true
+n: 1 # Latent recursion steps
+K: 2 # Deep recursion steps
+M: 8 # Height of scratchpad
+z_dim: 64 # Dimensionality of scratchpad
+```
+*(Note: Because the intrinsic FlowMol self-conditioning dummy pass evaluates probabilistically, it naturally acts as the first $K=0$ loop, and the main gradient pass naturally acts as $K=1$. Setting K inside the config accurately maps the hyperparameters conceptually as Deep Recursion Steps).*
+
+### Phase 2: Creating the Dedicated Layer Modules
+
+**Target File:** `src_gmmm/nn/layers.py`  
+**Action:** Define `LatentSyncModule` matching the exact sequence detailed in Section 3.3. This cleanly encapsulates the dense batching and Read-Compute-Write mechanisms inside the GNN loop constraints, utilizing a `nn.TransformerEncoder` block and completely bypassing the vector track `v`.
+
+```python
+# [NEW CODE] - Append to layers.py
+from torch_geometric.utils import to_dense_batch
+import torch.nn as nn
+import torch
+
+class LatentSyncModule(nn.Module):
+    def __init__(self, node_dim: int, z_dim: int, num_heads: int = 4, num_blocks: int = 2):
+        super().__init__()
+
+        self.node_dim, self.z_dim = node_dim, z_dim
+
+        # 1 Read: Used to inject information from s into z (with a residual connection)
+        self.read_attn = nn.MultiheadAttention(embed_dim=z_dim, kdim=node_dim, vdim=node_dim, num_heads=num_heads, batch_first=True)
+        self.read_mlp = nn.Linear(z_dim, z_dim)
+
+        # 2 Compute
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=z_dim,
+            nhead=4,
+            dim_feedforward=z_dim * 2,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True 
+        )
+        self.transformer_blocks = nn.TransformerEncoder(self.encoder_layer, num_layers=num_blocks)
+        
+        # 3 Write: Used to inject information from z into s (with a residual connection)
+        self.write_attn = nn.MultiheadAttention(embed_dim=node_dim, kdim=z_dim, vdim=z_dim, num_heads=4, batch_first=True)
+        self.write_mlp = nn.Linear(node_dim, node_dim)
+
+        # zero init for the mlps both weights and biases
+        nn.init.zeros_(self.read_mlp.weight); nn.init.zeros_(self.read_mlp.bias)
+        nn.init.zeros_(self.write_mlp.weight); nn.init.zeros_(self.write_mlp.bias)
+
+    def forward(self, z_old: torch.Tensor, s: torch.Tensor, v: torch.Tensor, node_index: torch.Tensor):
+        
+        #to dense representation
+        s_dense, mask = to_dense_batch(s, node_index) # [B, Max_N, node_dim]
+        
+        # 1 Read:  information s -> z
+        o_read, _ = self.read_attn(z_old, s_dense, s_dense, key_padding_mask=~mask)
+        z_new = z_old + self.read_mlp(o_read)
+
+        # 2 Compute: z -> z
+        z_proc = self.transformer_blocks(z_new)
+
+        # 3 Write:  information z -> s
+        o_write, _ = self.write_attn(s_dense, z_proc, z_proc)
+        s_new_dense = s_dense + self.write_mlp(o_write) # [B, Max_N, node_dim]
+
+        # back to sparse
+        s_new = s_new_dense[mask]
+
+        # TODO: Later add vector processing as well. Currently we just pass v through unchanged.
+        v_new = v
+        
+        return z_proc, s_new, v_new
+```
+
+### Phase 3: Updating the Main Encoder Pipeline
+
+**Target File:** `src_gmmm/nn/encoder.py`  
+**Where:** `EquivEncoder.__init__` and `EquivEncoder.forward`  
+**Action:** Include the `LatentSyncModule` import at the top of the file. Apply the initializations mapped specifically to the PyG batched setup (removing the old primer step since `LatentSyncModule` handles it internally in Phase 2). Execute the Latent modules synchronously with the $L$-layer loop.
+
+```python
+# [NEW CODE] - APPEND TO IMPORTS at top of file
+from ..nn.layers import LatentSyncModule
+
+# [EXISTING CODE] - __init__
+    def __init__(
+# [NEW CODE] -> add args latent_recursion=False, M=8, z_dim=64
+# ...
+        # [NEW CODE] - Initialization inside __init__
+        self.latent_recursion = latent_recursion
+        if self.latent_recursion:
+            # 1: initialization
+            self.z_base = nn.Parameter(torch.randn(M, z_dim) * 0.02) #initialize z_base with small random values
+             
+            # 2: latent recursion / sync layers. 
+            self.latent_sync_modules = nn.ModuleList([
+                LatentSyncModule(hidden_dim, z_dim) for _ in range(num_layers + 1) #+1 because we need a module as the primer
+            ]) 
+
+            # 3: readout residual MLP
+            self.z_residual = nn.Linear(z_dim, z_dim)
+            nn.init.zeros_(self.z_residual.weight); nn.init.zeros_(self.z_residual.bias) #0 initialization
+```
+
+```python
+# [EXISTING CODE] - forward signature
+    def forward(
+# [NEW CODE] -> add argument: z_prev: torch.Tensor = None
+# [EXISTING CODE] - forward execution start
+        # ... setup t, s, v ...
+        
+# [NEW CODE] - Latent Initialization & Primer (module 0)
+        Z_proc = z_prev
+        z_original = z_prev
+        if self.latent_recursion:
+            # PyG Batching Strategy: Expand dynamically at step n=0
+            if z_prev is None:
+                num_graphs = node_index.max() + 1
+                Z_proc = self.z_base.unsqueeze(0).expand(num_graphs, -1, -1)
+                z_original = Z_proc
+                
+            # Execute Primer Sync (Module 0) before Message Passing
+            Z_proc, node_states_s, node_states_v = self.latent_sync_modules[0](
+                z_old=Z_proc, s=node_states_s, v=node_states_v, node_index=node_index
+            )
+            
+# [NEW CODE] - Sync modules zipped into the interaction loop (modules 1 to L)
+        sync_modules = self.latent_sync_modules[1:] if self.latent_recursion else [None] * len(self.interactions)
+
+# [EXISTING CODE] - Iterative Interaction Loop
+        for (
+            interaction,
+            update, # ... [NEW CODE] and sync_module
+            sync_module
+        ) in zip(self.interactions, self.updates, sync_modules): 
+            node_states_s, node_states_v = interaction.forward(...)
+            node_states_s, node_states_v = update(node_states_s, node_states_v)
+
+# [NEW CODE] - Execute Phase 2 mapping immediately after the update layer
+            if self.latent_recursion:
+                Z_proc, node_states_s, node_states_v = sync_module(
+                     z_old=Z_proc, s=node_states_s, v=node_states_v, node_index=node_index
+                )
+
+# [NEW CODE] - Readout 
+        if self.latent_recursion:
+            Z_next = z_original + self.z_residual(Z_proc)
+            states["z_next"] = Z_next 
+            
+        return states
+```
+
+### Phase 4: Forward Routing
+
+**Target File:** `src_gmmm/model/score.py`  
+**Where:** `EquivariantParameterization.forward`  
+**Action:** Pass `z_prev` downward natively.
+
+```python
+# [EXISTING CODE]
+        edge_node_index: torch.Tensor,
+        prev_preds = None #self-conditioning: previous predictions
+    ):
+# [NEW CODE] -> Add z_prev=None
+# ...
+        states = self.encoder.forward(
+            t=t, h=h, pos=pos, node_index=node_index, edge_node_index=edge_node_index,
+            prev_preds=prev_preds,
+            z_prev=z_prev # [NEW CODE]
+        )
+# ...
+        # [NEW CODE] - Extract z_next and append to return payload
+        if "z_next" in states:
+            preds["z"] = states["z_next"]
+            
+        return preds
+```
+
+### Phase 5: The Latent Recursion Loop & Self-Conditioning Integrity
+
+**Target File:** `src_gmmm/model/diffusion.py`  
+**Where:** `EquivariantDiffusion.__init__` and `loss_diffusion` (and inherently `sample`)  
+**Action:** The explicit directive dictates `prev_preds` (FlowMol conditioning) must remain **completely unmodified/unaltered**. We define a custom independent `for k in range(self.K)` loop to execute Deep Recursion across Latent Recursion tracking our custom predicted starting points `x1`.
+
+```python
+# [EXISTING CODE] - __init__
+    def __init__(
+        # ...
+        self_conditioning: bool = False,
+        scprop: float = 0.9,
+# [NEW CODE]
+        latent_recursion: bool = False,
+        n: int = 1,
+        K: int = 2,
+    ):
+        # ...
+        self.latent_recursion = latent_recursion
+        self.n = n
+        self.K = K
+```
+
+```python
+# [EXISTING CODE] - loss_diffusion
+        #self-conditioning: run an inference step without backprop to get previous predictions
+        prev_preds = None 
+        if self.self_conditioning and torch.rand(1) < self.scprop:
+            with torch.no_grad():
+                prev_preds = self.parameterization.forward(
+                    t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                )
+
+
+# [NEW CODE COMPILES AS] -> The independent Deep Recursion K loop utilizing prev_preds
+        z_prev = None 
+
+        if self.latent_recursion:
+            for k in range(self.K): # Explicit K loop specified manually
+                
+                # 1. Latent Recursion Loop (predicting Z without modifying structural endpoints)
+                for i in range(self.n):
+                    preds_latent = self.parameterization.forward(
+                        t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                        prev_preds=prev_preds, z_prev=z_prev
+                    )
+                    z_prev = preds_latent.get("z", None) # Iterate Z matrix
+                    
+                # 2. Final Unified Pass for this Deep Recursion step
+                preds = self.parameterization.forward(
+                    t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                    prev_preds=prev_preds, z_prev=z_prev
+                )
+                z_prev = preds.get("z", None)
+                
+                # 3. Update structure for the next Deep Recursion step
+                if k < self.K - 1:
+                    prev_preds = {"pos": preds["pos"].detach(), "h": preds["h"].detach()}
+                    if z_prev is not None: z_prev = z_prev.detach()
+                    
+        else:
+            # Standard single pass if latent recursion disabled
+            preds = self.parameterization.forward(
+                t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                prev_preds=prev_preds
+            )
+        
+        # End loop, preds holds the final target predictions for loss computation
+```
+
+### Phase 6: Inference & Sampling Extension
+
+**Target File:** `src_gmmm/model/diffusion.py`  
+**Where:** `EquivariantDiffusion.reverse_step_em`  
+**Action:** Extract the `z` history intrinsically carried in `prev_preds` from the previous diffusion timestep, and execute the inner `n` Latent Recursion Loop to refine `z` before making the main prediction step.
+
+```python
+# [EXISTING CODE]
+    def reverse_step_em(
+        self,
+        t: torch.Tensor,
+        dt: torch.Tensor,
+        pos_t: torch.Tensor,
+        h_t: torch.Tensor,
+        node_index: torch.Tensor,
+        edge_node_index: torch.Tensor,
+        prev_preds: Optional[dict[torch.Tensor, torch.Tensor]] = None #self-conditioning: previous predictions
+    ):
+
+# [NEW CODE] - Inner n loop for inference
+        z_prev = prev_preds.get("z", None) if prev_preds is not None else None
+        
+        if getattr(self, "latent_recursion", False):
+            for i in range(self.n):
+                preds_latent = self.parameterization.forward(
+                    t=t, pos=pos_t, h=h_t, node_index=node_index, edge_node_index=edge_node_index,
+                    prev_preds=prev_preds, z_prev=z_prev
+                )
+                z_prev = preds_latent.get("z", None)
+                
+# [EXISTING CODE]
+        # get NN predictions
+        preds = self.parameterization.forward(
+            t=t,
+            pos=pos_t,
+            h=h_t,
+            node_index=node_index,
+            edge_node_index=edge_node_index,
+            prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
+# [NEW CODE] -> Add z_prev argument
+            z_prev=z_prev
+        )
+# ... continues unaltered ...
+```
+

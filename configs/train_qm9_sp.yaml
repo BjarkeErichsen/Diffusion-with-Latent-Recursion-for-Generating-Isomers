@@ -30,8 +30,8 @@ self_conditioning: true        #self-conditioning: whether to use self-condition
 latent_recursion: true  #latent-recursion: whether to use latent recursion (ASSUMES self-conditioning == True)
 n: 1 #latent-recursion: REQUIREMENT n>=0, number of latent recursion steps
 K: 2 #deep-recursion: REQUIREMENT K>=2,number of deep recursion steps 
-M: 8 #latent-recursion: height of scratchpad
-z_dim: 64 #latent-recursion: dimensionality of scratchpad
+M: 1 #latent-recursion: height of scratchpad
+z_dim: 64 #64 #latent-recursion: dimensionality of scratchpad
 
 # validation
 monitor_metric: "val/molecule_stable"
