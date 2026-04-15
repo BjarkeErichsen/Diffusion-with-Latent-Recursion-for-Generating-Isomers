@@ -16,6 +16,9 @@ class EquivariantDiffusion(nn.Module):
         diffusion_h: Optional[ContinuousDiffusion],
         self_conditioning: bool = False, #self-conditioning: whether to use self-conditioning
         scprop: float = 0.9,  #self-conditioning: probability of using self-conditioning
+        latent_recursion: bool = False, #latent recursion: whether to use latent recursion
+        n: int = 1, #latent recursion: number of latent recursion steps
+        K: int = 2, #latent recursion: number of deep recursion steps
     ):
         super().__init__()
 
@@ -25,12 +28,16 @@ class EquivariantDiffusion(nn.Module):
         self.self_conditioning = self_conditioning #self-conditioning: whether to use self-conditioning
         self.scprop = scprop #self-conditioning: probability of using self-conditioning
 
+        self.latent_recursion = latent_recursion
+        self.n = n
+        self.K = K 
+
     def loss_diffusion(self, t: torch.Tensor, batch: Batch | Data):
         latents, targets = self.training_targets(t=t, batch=batch)
         
         #self-conditioning: run an inference step without backprop to get previous predictions
         prev_preds = None 
-        if self.self_conditioning and torch.rand(1) < self.scprop:
+        if self.self_conditioning and not self.latent_recursion and torch.rand(1) < self.scprop:
             with torch.no_grad():
                 prev_preds = self.parameterization.forward(
                     t=t,
@@ -39,13 +46,46 @@ class EquivariantDiffusion(nn.Module):
                     edge_node_index=batch.edge_node_index,
                 )
         
-        preds = self.parameterization.forward(
-            t=t,
-            **latents,
-            node_index=batch.batch,
-            edge_node_index=batch.edge_node_index,
-            prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
-        )
+        #latent recursion: arbitrary number of recursion steps
+
+        z_prev = None
+        if self.latent_recursion:
+            
+            #deep recursion
+            for k in range(self.K):
+                #latent recursion
+                for i in range(self.n):
+                    preds = self.parameterization.forward(
+                        t=t,
+                        **latents,
+                        node_index=batch.batch,
+                        edge_node_index=batch.edge_node_index,
+                        prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
+                        z_prev=z_prev, #latent recursion: pass previous latent states to the model
+                    )
+                    z_prev = preds.get("z", None)
+                
+                # Update X1 (prevpreds) and Z, detach
+                preds = self.parameterization.forward(
+                    t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                    prev_preds=prev_preds, z_prev=z_prev
+                )
+                z_prev = preds.get("z", None)
+
+                # Detach unless final iteration
+                if k < self.K - 1:
+                    prev_preds = {k: v.detach() for k, v in preds.items()}
+                    z_prev = z_prev.detach()
+        
+        else:
+            preds = self.parameterization.forward(
+                t=t,
+                **latents,
+                node_index=batch.batch,
+                edge_node_index=batch.edge_node_index,
+                prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
+                z_prev=z_prev, #latent recursion: pass previous latent states to the model
+            )
 
         losses = {}
 

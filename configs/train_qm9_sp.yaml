@@ -27,6 +27,11 @@ parameterization: "x0"
 
 # TRM / self-cond specific
 self_conditioning: true        #self-conditioning: whether to use self-conditioning 
+latent_recursion: true  #latent-recursion: whether to use latent recursion (ASSUMES self-conditioning == True)
+n: 1 #latent-recursion: REQUIREMENT n>=0, number of latent recursion steps
+K: 2 #deep-recursion: REQUIREMENT K>=2,number of deep recursion steps 
+M: 8 #latent-recursion: height of scratchpad
+z_dim: 64 #latent-recursion: dimensionality of scratchpad
 
 # validation
 monitor_metric: "val/molecule_stable"
@@ -61,6 +66,9 @@ lit_module:
     diffusion_h: null   #Currently we ONLY compute loss from eucledian positions
     scprop: 0.5         #self-conditioning: probability of using self-conditioning (ONLY used when self_conditioning is true)
     self_conditioning: ${self_conditioning}
+    latent_recursion: ${latent_recursion}
+    n: ${n}
+    K: ${K}
     
     parameterization:
       _target_: src_gmmm.model.score.EquivariantParameterization
@@ -79,6 +87,9 @@ lit_module:
         smooth_h: false
         self_conditioning: ${self_conditioning}        #self-conditioning: whether to use self-conditioning 
         h_input_dim: 100 # all periodic table
+        latent_recursion: ${latent_recursion} #latent-recursion: whether to use latent recursion
+        M: ${M} #latent-recursion: height of scratchpad
+        z_dim: ${z_dim} #latent-recursion: dimensionality of scratchpad
 
       readout:
         _target_: src_gmmm.nn.readout.DataPointReadout

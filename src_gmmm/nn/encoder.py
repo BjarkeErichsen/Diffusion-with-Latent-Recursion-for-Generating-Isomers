@@ -6,7 +6,7 @@ from torch_scatter import scatter_sum
 
 from ..nn.layers import EdgeEmbedding, EquivLayerNorm, FourierEmbedding
 from ..nn.layers import SelfConditioningResidualLayer #self-conditioning
-
+from ..nn.layers import LatentSyncModule #latent-recursion
 
 class InteractionLayer(nn.Module):
     def __init__(
@@ -138,6 +138,9 @@ class EquivEncoder(nn.Module):
         h_input_dim: int = 100,
         smooth_h: bool = True,
         self_conditioning: bool = False, #self-conditioning
+        latent_recursion: bool = False, #latent recursion
+        M: int = 8, #latent recursion: rows latent dimension
+        z_dim: int = 64 #latent dimension: columns latent dimension
     ):
         super(EquivEncoder, self).__init__()
 
@@ -182,6 +185,21 @@ class EquivEncoder(nn.Module):
                 node_dim = hidden_dim, 
                 edge_dim = edge_embedding.out_features
             )
+        
+        #latent recursion
+        self.latent_recursion = latent_recursion
+        if latent_recursion:
+            # 1: initialization
+            self.z_base = nn.Parameter(torch.randn(M, z_dim)* 0.02) #initialize z_base with small random values
+             
+            # 2: latent recursion / sync layers. 
+            self.latent_sync_modules = nn.ModuleList([
+                LatentSyncModule(hidden_dim, z_dim) for _ in range(num_layers + 1) #+1 because we need a module as the primer
+            ]) 
+
+            # 3: readout residual MLP
+            self.z_residual = nn.Linear(z_dim, z_dim)
+            nn.init.zeros_(self.z_residual.weight); nn.init.zeros_(self.z_residual.bias) #0 initialization
 
     def forward(
         self,
@@ -191,6 +209,7 @@ class EquivEncoder(nn.Module):
         node_index: torch.Tensor,
         edge_node_index: Optional[torch.Tensor],
         prev_preds: dict[torch.Tensor, torch.Tensor] = None, #self-conditioning previous predictions
+        z_prev: torch.Tensor = None, #latent recursion previous z
     ) -> dict[str, torch.Tensor]:
 
         t = self.time_embedding(t)
@@ -216,10 +235,30 @@ class EquivEncoder(nn.Module):
                 edge_node_index = edge_node_index
             )
 
+        #latent recursion: initialize z_prev and run primer
+        Z_proc = z_prev
+        z_original = z_prev
+        if self.latent_recursion:
+            if z_prev is None:
+                num_graphs = node_index.max() + 1
+                Z_proc = self.z_base.unsqueeze(0).expand(num_graphs, -1, -1)
+                z_original = Z_proc
+            
+            #primer (using module 1)
+            Z_proc, node_states_s, node_states_v = self.latent_sync_modules[0](
+                z_old = Z_proc,
+                s = node_states_s,
+                v = node_states_v,
+                node_index = node_index
+                )
+        
+        sync_modules = self.latent_sync_modules[1:] if self.latent_recursion else [None] * len(self.interactions) # latent recursion:we need this, otherwise running without latent recursion will throw an error
+
         for (
             interaction,
             update,
-        ) in zip(self.interactions, self.updates):
+            sync_module
+        ) in zip(self.interactions, self.updates, sync_modules):
             node_states_s, node_states_v = interaction.forward(
                 node_states_s=node_states_s,
                 node_states_v=node_states_v,
@@ -229,7 +268,20 @@ class EquivEncoder(nn.Module):
                 edge_node_index=edge_node_index,
             )
             node_states_s, node_states_v = update(node_states_s, node_states_v)
-
+            
+            if self.latent_recursion:
+                Z_proc, node_states_s, node_states_v = sync_module(
+                    z_old = Z_proc,
+                    s = node_states_s,
+                    v = node_states_v,
+                    node_index = node_index
+                )
+        
         states = {"s": node_states_s, "v": node_states_v}
+        
+        #latent recursion: final readout with residual connection
+        if self.latent_recursion:
+            Z_next = z_original + self.z_residual(Z_proc)
+            states["z"] = Z_next
 
         return states

@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch_scatter import scatter_mean
+from torch_geometric.utils import to_dense_batch
 
 
 def cosine_cutoff(edge_distances: torch.Tensor, cutoff: float):
@@ -226,5 +227,59 @@ class SelfConditioningResidualLayer(nn.Module):
 
         return node_states_s, edge_states
 
-        
 
+# latent recursion module
+class LatentSyncModule(nn.Module):
+    def __init__(self, node_dim: int, z_dim:int, num_heads: int = 4, num_blocks: int = 2):
+        super().__init__()
+
+        self.node_dim, self.z_dim = node_dim, z_dim
+
+        # 1 Read: Used to inject information from s into z (with a residual connection)
+        self.read_attn = nn.MultiheadAttention(embed_dim=z_dim, kdim=node_dim, vdim=node_dim, num_heads=num_heads, batch_first=True)
+        self.read_mlp = nn.Linear(z_dim, z_dim)
+
+
+        # 2 Compute
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=z_dim,
+            nhead=4,
+            dim_feedforward=z_dim * 2,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True 
+        )
+        self.transformer_blocks = nn.TransformerEncoder(self.encoder_layer, num_layers=num_blocks)
+        
+        # 3 Write: Used to inject information from z into s (with a residual connection)
+        self.write_attn = nn.MultiheadAttention(embed_dim=node_dim, kdim=z_dim, vdim=z_dim, num_heads=4, batch_first=True)
+        self.write_mlp = nn.Linear(node_dim, node_dim)
+
+        # zero init for the mlps both weights and biases
+        nn.init.zeros_(self.read_mlp.weight); nn.init.zeros_(self.read_mlp.bias)
+        nn.init.zeros_(self.write_mlp.weight); nn.init.zeros_(self.write_mlp.bias)
+
+    def forward(self, z_old: torch.Tensor, s: torch.Tensor, v: torch.Tensor, node_index: torch.Tensor):
+        
+        #to dense representation
+        s_dense, mask = to_dense_batch(s, node_index) # [B, Max_N, node_dim]
+        
+        # 1 Read:  information s -> z
+        o_read, _ = self.read_attn(z_old, s_dense, s_dense, key_padding_mask=~mask)
+        z_new = z_old + self.read_mlp(o_read)
+
+        # 2 Compute: z -> z
+        z_proc = self.transformer_blocks(z_new)
+
+        # 3 Write:  information z -> s
+        o_write, _ = self.write_attn(s_dense, z_proc, z_proc)
+        s_new_dense = s_dense + self.write_mlp(o_write) # [B, N_max, node_dim]
+
+        # back to sparse
+        s_new = s_new_dense[mask]
+
+        # TODO: Later add vector processing as well. Currently we just pass v through unchanged.
+        v_new = v
+        
+        return z_proc, s_new, v_new

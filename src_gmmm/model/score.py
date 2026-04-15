@@ -22,7 +22,8 @@ class EquivariantParameterization(nn.Module):
         pos: torch.Tensor,
         node_index: torch.Tensor,
         edge_node_index: torch.Tensor,
-        prev_preds = None #self-conditioning: previous predictions
+        prev_preds = None, #self-conditioning: previous predictions
+        z_prev = None, #latent recursion: previous latent states
     ):
         states = self.encoder.forward(
             t=t,
@@ -31,8 +32,10 @@ class EquivariantParameterization(nn.Module):
             node_index=node_index,
             edge_node_index=edge_node_index,
             prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
+            z_prev=z_prev, #latent recursion: pass previous latent states to the model
         )
-        return self.readout.forward(
+
+        preds = self.readout.forward(
             t,
             states,
             h=h,
@@ -40,3 +43,8 @@ class EquivariantParameterization(nn.Module):
             node_index=node_index,
             edge_node_index=edge_node_index,
         )
+
+        if "z" in states: #equivalent to checking if latent_recursion is True
+           preds["z"] = states["z"]
+        
+        return preds
