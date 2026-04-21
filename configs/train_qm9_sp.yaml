@@ -30,8 +30,10 @@ self_conditioning: true        #self-conditioning: whether to use self-condition
 latent_recursion: true  #latent-recursion: whether to use latent recursion (ASSUMES self-conditioning == True)
 n: 1 #latent-recursion: REQUIREMENT n>=0, number of latent recursion steps
 K: 2 #deep-recursion: REQUIREMENT K>=2,number of deep recursion steps 
-M: 1 #latent-recursion: height of scratchpad
-z_dim: 64 #64 #latent-recursion: dimensionality of scratchpad
+M: 8 #latent-recursion: scratchpad number of tokens
+z_dim: 64 #64 #latent-recursion: scratchpad latent dim
+eval_trm: 0 #number of trajectories to save per validation run
+scprop: 0.5 #self-conditioning and latent recursion: probability of using self-conditioning and latent recursion (ONLY used when self_conditioning is true)
 
 # validation
 monitor_metric: "val/molecule_stable"
@@ -64,11 +66,12 @@ lit_module:
     _target_: src_gmmm.model.diffusion.EquivariantDiffusion
 
     diffusion_h: null   #Currently we ONLY compute loss from eucledian positions
-    scprop: 0.5         #self-conditioning: probability of using self-conditioning (ONLY used when self_conditioning is true)
+    scprop: ${scprop}         #self-conditioning: probability of using self-conditioning (ONLY used when self_conditioning is true)
     self_conditioning: ${self_conditioning}
     latent_recursion: ${latent_recursion}
     n: ${n}
     K: ${K}
+    eval_trm: ${eval_trm}
     
     parameterization:
       _target_: src_gmmm.model.score.EquivariantParameterization

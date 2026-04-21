@@ -90,9 +90,9 @@ class LitModule(pl.LightningModule):
 
         return loss, losses
 
-    def sample_step(self, batch):
+    def sample_step(self, batch, batch_idx: Optional[int] = None):
         # sample
-        atoms = self.sample(batch)
+        atoms = self.sample(batch, batch_idx=batch_idx)
 
         if self.metrics:
             self.metrics.update(atoms)
@@ -129,15 +129,15 @@ class LitModule(pl.LightningModule):
             del losses
 
         # sample
-        atoms = self.sample_step(batch)
+        atoms = self.sample_step(batch, batch_idx=batch_idx)
 
         return atoms
 
     def test_step(self, batch, batch_idx):
-        return self.sample_step(batch)
+        return self.sample_step(batch, batch_idx=batch_idx)
 
     def predict_step(self, batch, batch_idx: int, dataloader_idx: int = 0):
-        return self.sample(batch)
+        return self.sample(batch, batch_idx=batch_idx)
 
     def compute_and_log_metrics(self, stage: str):
         for metrics in [
@@ -166,11 +166,13 @@ class LitModule(pl.LightningModule):
         self.compute_and_log_metrics(stage="test")
 
     @torch.no_grad()
-    def sample(self, batch, ema: bool = True) -> list[ase.Atoms]:
+    def sample(self, batch, ema: bool = True, batch_idx: int = 0) -> list[ase.Atoms]:
         model = self.get_model(ema=ema)
         ptr = batch.ptr
 
-        samples = model.sample(batch, n_steps=self.hparams.n_integration_steps)
+        eval_override = batch_idx < getattr(model, "eval_trm", 0) #latent recursion: whether to save the intermediate latent states for trm
+
+        samples = model.sample(batch, n_steps=self.hparams.n_integration_steps, eval_trm_override=eval_override, epoch=self.current_epoch) #latent recursion: added epoch and eval_override
         atoms = self.atoms_from_tensors(**samples, ptr=ptr)
         return atoms
 

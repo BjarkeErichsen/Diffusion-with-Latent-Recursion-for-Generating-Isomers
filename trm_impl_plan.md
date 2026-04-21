@@ -157,10 +157,11 @@ import torch.nn as nn
 import torch
 
 class LatentSyncModule(nn.Module):
-    def __init__(self, node_dim: int, z_dim: int, num_heads: int = 4, num_blocks: int = 2):
+    def __init__(self, node_dim: int, z_dim:int, num_heads: int = 4, num_blocks: int = 2, skip_transformer_block: bool = False):
         super().__init__()
 
         self.node_dim, self.z_dim = node_dim, z_dim
+        self.skip_transformer_block = skip_transformer_block
 
         # 1 Read: Used to inject information from s into z (with a residual connection)
         self.read_attn = nn.MultiheadAttention(embed_dim=z_dim, kdim=node_dim, vdim=node_dim, num_heads=num_heads, batch_first=True)
@@ -389,7 +390,7 @@ from ..nn.layers import LatentSyncModule
 
 **Target File:** `src_gmmm/model/diffusion.py`  
 **Where:** `EquivariantDiffusion.reverse_step_em`  
-**Action:** Extract the `z` history intrinsically carried in `prev_preds` from the previous diffusion timestep, and execute the inner `n` Latent Recursion Loop to refine `z` before making the main prediction step.
+**Action:** Extract the `z` history intrinsically carried in `prev_preds` from the previous diffusion timestep, and execute the inner `n` latent recursion loop to refine `z` before making the main prediction step. Keep the implementation minimal by only using the inner latent recursion loop (no $K$ deep recursion loop is used during sampling).
 
 ```python
 # [EXISTING CODE]
@@ -430,3 +431,154 @@ from ..nn.layers import LatentSyncModule
 # ... continues unaltered ...
 ```
 
+### Phase 7: TRM Evaluation Tracking (`eval_trm`)
+
+**Target File 1:** `src_gmmm/utils/trm_eval.py`  
+**Action:** Create a single function `save_trm_eval_data` using `HydraConfig` to route logs to the active run folder.
+
+```python
+def save_trm_eval_data(data: Dict[str, Any]):
+    # Uses HydraConfig.get().runtime.output_dir
+    # Saves unified lists for X_t, X_1, and transposed iteration lists Z_i.pt
+```
+
+**Target File 2:** `src_gmmm/model/diffusion.py`  
+**Action:** Use `eval_trm_data` dictionary to buffer states and call `save_trm_eval_data` at the end of `sample()`.
+
+
+**Target File 2:** `src_gmmm/model/diffusion.py`  
+**Where:** `EquivariantDiffusion.__init__`, `reverse_step_em`, and `sample`  
+**Action:** Accumulate lists internally inside a dictionary, then call `save_trm_eval_data(eval_trm_data)` at the end.
+
+```python
+# [EXISTING CODE] - __init__
+# ...
+        latent_recursion: bool = False,
+        n: int = 1,
+        K: int = 2,
+# [NEW CODE] -> add eval_trm parameter
+        eval_trm: bool = False,
+    ):
+        # ...
+        self.K = K
+        self.eval_trm = eval_trm
+```
+
+```python
+# [EXISTING CODE] - reverse_step_em
+    def reverse_step_em(
+        self,
+        # ...
+        prev_preds: Optional[dict[torch.Tensor, torch.Tensor]] = None 
+    ):
+# [NEW CODE] - Init tracking sequence
+        z_intermediates = []
+        
+        z_prev = prev_preds.get("z", None) if prev_preds is not None else None
+        
+        if self.latent_recursion:
+            for i in range(self.n):
+                preds = self.parameterization.forward(
+                    # ...
+                )
+                z_prev = preds.get("z", None)
+                if self.eval_trm and z_prev is not None:
+                    z_intermediates.append(z_prev.detach().cpu())
+
+        # get NN predictions
+        preds = self.parameterization.forward(
+        # ...
+        
+# [NEW CODE] - Pass tracked tensors into payload for Sample step
+        if self.eval_trm and "z" in preds:
+            z_intermediates.append(preds["z"].detach().cpu())
+            preds["z_intermediates"] = z_intermediates 
+
+        # reverse step on each modality
+# ...
+```
+
+```python
+# [EXISTING CODE] - sample 
+        prev_preds = None  
+# [NEW CODE] - Setup eval tracking buffers dict
+# [DEPRECATED - Moved tracking logic inside loop natively to `if i == 0` check]
+
+# [EXISTING CODE] - Inside the n_steps loop
+        for i in range(n_steps):
+            # ...
+            if method == "em":
+                pos_t, h_t, prev_preds = self.reverse_step_em( 
+                    # ...
+                )
+
+# [NEW CODE] - Track variables dynamically without assuming categorical 'h' is tracked
+            if self.eval_trm:
+                if i == 0: 
+                    eval_trm_data = {
+                        "X_t": {"pos": [], "h": []}, 
+                        "X_1": {"pos": [], "h": []}, 
+                        "Z": [],
+                        "val_datapoint": {"pos": to_dense_batch(batch.pos, batch.batch)[0].detach().cpu(), 
+                                          "h": to_dense_batch(batch.h, batch.batch)[0].detach().cpu(), 
+                                          "edge_node_index": batch.edge_node_index.detach().cpu(),
+                                          "mask": to_dense_batch(batch.pos, batch.batch)[1].detach().cpu()}
+                    }  #evaluation trm
+
+                if pos_t is not None:
+                    eval_trm_data["X_t"]["pos"].append(to_dense_batch(pos_t, node_index)[0].detach().cpu())
+                
+                if h_t is not None:
+                    eval_trm_data["X_t"]["h"].append(to_dense_batch(h_t, node_index)[0].detach().cpu())
+                    
+                if prev_preds:
+                    if "pos" in prev_preds and prev_preds["pos"] is not None:
+                        eval_trm_data["X_1"]["pos"].append(to_dense_batch(prev_preds["pos"], node_index)[0].detach().cpu())
+                    if "h" in prev_preds and prev_preds["h"] is not None:
+                        eval_trm_data["X_1"]["h"].append(to_dense_batch(prev_preds["h"], node_index)[0].detach().cpu())
+                    
+                    eval_trm_data["Z"].append(prev_preds.get("z_intermediates", []))
+                
+                if i == n_steps - 1:
+                    save_trm_eval_data(eval_trm_data)
+                     
+# [EXISTING CODE] - End of sample function
+        samples = {
+            "pos": pos_t,
+            "h": h_t,
+        }
+
+# [NEW CODE] - Serialize tracked elements to disk efficiently via function call
+# [DEPRECATED - serialization moved to `if i == n_steps - 1` inside main loop]
+
+# [EXISTING CODE]
+        if return_traj:
+            return samples, traj
+```
+
+### Phase 8: Add Latent Normalization (RMSNorm)
+
+**Target File:** `src_gmmm/nn/layers.py`  
+**Location:** `LatentSyncModule`  
+**Action:** Implement and incorporate a full RMS Normalization layer with learnable weights. The implementation specifically focuses on normalizing the **residual updates** and the **final output** to ensure a clean identity path while maintaining stability.
+
+**Specific Logic:**
+*   **Layer Definition:** Define an `RMSNorm` module that calculates $\frac{x}{\text{RMS}(x)} * \gamma$, where $\gamma$ is a learnable parameter of size `z_dim`.
+*   **Normalization of Residual (Read):** Pass the result of the `read_mlp` projection through `self.norm_read` **before** adding it to the parent state. This keeps the identity path $z_{old} + \dots$ clean while ensuring the incoming information is scale-standardized.
+*   **Normalization of Final State (Compute):** Pass the output of the transformer blocks through `self.norm_compute`. This provides the essential global magnitude control for $Z$ before it is used for writing to nodes or passed to the next recursion step.
+
+```python
+# [NEW CODE] - Actual Logic in LatentSyncModule.forward
+# 1. Read: Normalize only the update to keep the identity path intact
+o_read_norm = self.norm_read(self.read_mlp(o_read)) 
+z_new = z_old + o_read_norm #residual connection is kept intact -> no completicated identity path
+
+# 2. Compute: Normalize the final output of the transformer
+if self.skip_transformer_block:
+    z_proc = z_new
+else:
+    z_proc = self.transformer_blocks(z_new)
+
+#Normalize output of transformer #TODO maybe not needed
+z_proc = self.norm_compute(z_proc)
+```

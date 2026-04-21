@@ -185,7 +185,10 @@ class EquivEncoder(nn.Module):
                 node_dim = hidden_dim, 
                 edge_dim = edge_embedding.out_features
             )
-        
+            
+            #self.v_mlp = nn.Linear(3, 3*hidden_dim) #only used if we want to use v-conditioning
+
+
         #latent recursion
         self.latent_recursion = latent_recursion
         if latent_recursion:
@@ -201,6 +204,9 @@ class EquivEncoder(nn.Module):
             self.z_residual = nn.Linear(z_dim, z_dim)
             nn.init.zeros_(self.z_residual.weight); nn.init.zeros_(self.z_residual.bias) #0 initialization
 
+            
+
+
     def forward(
         self,
         t: torch.Tensor,
@@ -210,12 +216,15 @@ class EquivEncoder(nn.Module):
         edge_node_index: Optional[torch.Tensor],
         prev_preds: dict[torch.Tensor, torch.Tensor] = None, #self-conditioning previous predictions
         z_prev: torch.Tensor = None, #latent recursion previous z
+        
     ) -> dict[str, torch.Tensor]:
 
         t = self.time_embedding(t)
         t_per_atom = t[node_index]
 
         node_states_v = pos.new_zeros((*pos.shape, self.hidden_dim))
+
+
         node_states_s = self.node_embedding(h)
         node_states_s = torch.cat([node_states_s, t_per_atom], dim=1)
         node_states_s = self.node_time_projection(node_states_s)
@@ -232,8 +241,16 @@ class EquivEncoder(nn.Module):
                 pos = pos, 
                 prev_preds = prev_preds, 
                 node_index = node_index, 
-                edge_node_index = edge_node_index
+                edge_node_index = edge_node_index,
             )
+            #method 1
+            #v = (pos - prev_preds["pos"]) / (torch.norm(pos - prev_preds["pos"], dim=-1, keepdim=True) + 1e-12) 
+            #v = self.v_mlp(v).reshape(-1, 3, self.hidden_dim) 
+            #node_states_v = v
+            
+            # #TODO method 2
+            #src, dst = edge_node_index
+            #node_states_v = torch.norm(prev_preds["pos"][src] - prev_preds["pos"][dst], dim=-1, keepdim=True)
 
         #latent recursion: initialize z_prev and run primer
         Z_proc = z_prev
@@ -269,7 +286,7 @@ class EquivEncoder(nn.Module):
             )
             node_states_s, node_states_v = update(node_states_s, node_states_v)
             
-            if self.latent_recursion:
+            if self.latent_recursion: #: #Set to false to disable
                 Z_proc, node_states_s, node_states_v = sync_module(
                     z_old = Z_proc,
                     s = node_states_s,

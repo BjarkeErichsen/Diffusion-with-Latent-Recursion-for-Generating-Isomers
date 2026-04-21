@@ -194,6 +194,7 @@ class SelfConditioningResidualLayer(nn.Module):
             nn.Linear(edge_dim, edge_dim)
         )
 
+        
 
     def forward(self, node_states_s, edge_states, pos , prev_preds, node_index, edge_node_index):
         prev_pos = prev_preds["pos"]
@@ -206,8 +207,6 @@ class SelfConditioningResidualLayer(nn.Module):
         #concat current node state, hte predicted h node states and the predicted distance
         node_resid_input = torch.cat([node_states_s, node_dist], dim=-1) #TODO: add prev_h when we start using diffusion_h
         node_states_s = node_states_s + self.node_mlp(node_resid_input) #map back to dim of s 
-
-        #TODO: Maybe add self-conditioning for node states v as well?
 
         #Edges e
         src, dst = edge_node_index
@@ -228,17 +227,32 @@ class SelfConditioningResidualLayer(nn.Module):
         return node_states_s, edge_states
 
 
+
+
+#ONLY scaling, no bias
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.scaling = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        # Normalize across the feature dimension (z_dim)
+        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
+        return (x / rms) * self.scaling
+
+
 # latent recursion module
 class LatentSyncModule(nn.Module):
-    def __init__(self, node_dim: int, z_dim:int, num_heads: int = 4, num_blocks: int = 2):
+    def __init__(self, node_dim: int, z_dim:int, num_heads: int = 4, num_blocks: int = 2, skip_transformer_block: bool = False):
         super().__init__()
 
         self.node_dim, self.z_dim = node_dim, z_dim
+        self.skip_transformer_block = skip_transformer_block
 
         # 1 Read: Used to inject information from s into z (with a residual connection)
         self.read_attn = nn.MultiheadAttention(embed_dim=z_dim, kdim=node_dim, vdim=node_dim, num_heads=num_heads, batch_first=True)
         self.read_mlp = nn.Linear(z_dim, z_dim)
-
 
         # 2 Compute
         self.encoder_layer = nn.TransformerEncoderLayer(
@@ -256,9 +270,15 @@ class LatentSyncModule(nn.Module):
         self.write_attn = nn.MultiheadAttention(embed_dim=node_dim, kdim=z_dim, vdim=z_dim, num_heads=4, batch_first=True)
         self.write_mlp = nn.Linear(node_dim, node_dim)
 
+        #layer norm on each token of z
+
         # zero init for the mlps both weights and biases
         nn.init.zeros_(self.read_mlp.weight); nn.init.zeros_(self.read_mlp.bias)
         nn.init.zeros_(self.write_mlp.weight); nn.init.zeros_(self.write_mlp.bias)
+
+        #RMSNorm layers
+        self.norm_read = RMSNorm(z_dim)
+        self.norm_compute = RMSNorm(z_dim)
 
     def forward(self, z_old: torch.Tensor, s: torch.Tensor, v: torch.Tensor, node_index: torch.Tensor):
         
@@ -267,15 +287,22 @@ class LatentSyncModule(nn.Module):
         
         # 1 Read:  information s -> z
         o_read, _ = self.read_attn(z_old, s_dense, s_dense, key_padding_mask=~mask)
-        z_new = z_old + self.read_mlp(o_read)
+        o_read_norm = self.norm_read(self.read_mlp(o_read)) 
+        z_new = z_old + o_read_norm #residual connection is kept intact -> no completicated identity path
 
         # 2 Compute: z -> z
-        z_proc = self.transformer_blocks(z_new)
+        if self.skip_transformer_block:
+            z_proc = z_new
+        else:
+            z_proc = self.transformer_blocks(z_new)
+    
+        #Normalize output of transformer #TODO maybe not needed
+        z_proc = self.norm_compute(z_proc)
 
         # 3 Write:  information z -> s
         o_write, _ = self.write_attn(s_dense, z_proc, z_proc)
         s_new_dense = s_dense + self.write_mlp(o_write) # [B, N_max, node_dim]
-
+        
         # back to sparse
         s_new = s_new_dense[mask]
 
