@@ -7,6 +7,7 @@ from torch_scatter import scatter_sum
 from ..nn.layers import EdgeEmbedding, EquivLayerNorm, FourierEmbedding
 from ..nn.layers import SelfConditioningResidualLayer #self-conditioning
 from ..nn.layers import LatentSyncModule #latent-recursion
+from ..utils.trm_utilities import SinusoidalPositionalEncoding #latent-recursion
 
 class InteractionLayer(nn.Module):
     def __init__(
@@ -186,7 +187,7 @@ class EquivEncoder(nn.Module):
                 edge_dim = edge_embedding.out_features
             )
             
-            #self.v_mlp = nn.Linear(3, 3*hidden_dim) #only used if we want to use v-conditioning
+            self.v_mlp = nn.Linear(hidden_dim, hidden_dim) #only used if we want to use v-conditioning
 
 
         #latent recursion
@@ -202,10 +203,9 @@ class EquivEncoder(nn.Module):
 
             # 3: readout residual MLP
             self.z_residual = nn.Linear(z_dim, z_dim)
-            nn.init.zeros_(self.z_residual.weight); nn.init.zeros_(self.z_residual.bias) #0 initialization
+            #nn.init.zeros_(self.z_residual.weight); nn.init.zeros_(self.z_residual.bias) #0 initialization
 
-            
-
+            self.z_pe = SinusoidalPositionalEncoding(d_model=z_dim, max_len=M)
 
     def forward(
         self,
@@ -223,8 +223,6 @@ class EquivEncoder(nn.Module):
         t_per_atom = t[node_index]
 
         node_states_v = pos.new_zeros((*pos.shape, self.hidden_dim))
-
-
         node_states_s = self.node_embedding(h)
         node_states_s = torch.cat([node_states_s, t_per_atom], dim=1)
         node_states_s = self.node_time_projection(node_states_s)
@@ -244,9 +242,9 @@ class EquivEncoder(nn.Module):
                 edge_node_index = edge_node_index,
             )
             #method 1
-            #v = (pos - prev_preds["pos"]) / (torch.norm(pos - prev_preds["pos"], dim=-1, keepdim=True) + 1e-12) 
-            #v = self.v_mlp(v).reshape(-1, 3, self.hidden_dim) 
-            #node_states_v = v
+            v = (pos - prev_preds["pos"]) / (torch.norm(pos - prev_preds["pos"], dim=-1, keepdim=True) + 1e-12) 
+            v = v.unsqueeze(-1).expand(-1, -1, self.hidden_dim) # v (N x 3) -> (N x 3 x F) 
+            node_states_v = self.v_mlp(v)
             
             # #TODO method 2
             #src, dst = edge_node_index
@@ -259,6 +257,9 @@ class EquivEncoder(nn.Module):
             if z_prev is None:
                 num_graphs = node_index.max() + 1
                 Z_proc = self.z_base.unsqueeze(0).expand(num_graphs, -1, -1)
+
+                #Z_proc = Z_proc + self.z_pe() #positional encoding
+
                 z_original = Z_proc
             
             #primer (using module 1)

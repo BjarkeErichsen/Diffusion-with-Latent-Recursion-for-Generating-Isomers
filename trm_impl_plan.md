@@ -582,3 +582,16 @@ else:
 #Normalize output of transformer #TODO maybe not needed
 z_proc = self.norm_compute(z_proc)
 ```
+
+
+### Phase 9: (not done yet) Adding time conditioning to Z
+
+### Phase 10: (not done yet) Masking Padded Atoms in Latent Write Step 
+
+### Phase 11: (not done yet)  Added pos embeddings
+
+
+file: trm_utilities is added
+
+self.z_pe = SinusoidalPositionalEncoding(d_model=z_dim, max_len=M)
+

@@ -272,10 +272,6 @@ class LatentSyncModule(nn.Module):
 
         #layer norm on each token of z
 
-        # zero init for the mlps both weights and biases
-        nn.init.zeros_(self.read_mlp.weight); nn.init.zeros_(self.read_mlp.bias)
-        nn.init.zeros_(self.write_mlp.weight); nn.init.zeros_(self.write_mlp.bias)
-
         #RMSNorm layers
         self.norm_read = RMSNorm(z_dim)
         self.norm_compute = RMSNorm(z_dim)
@@ -288,6 +284,7 @@ class LatentSyncModule(nn.Module):
         # 1 Read:  information s -> z
         o_read, _ = self.read_attn(z_old, s_dense, s_dense, key_padding_mask=~mask)
         o_read_norm = self.norm_read(self.read_mlp(o_read)) 
+        
         z_new = z_old + o_read_norm #residual connection is kept intact -> no completicated identity path
 
         # 2 Compute: z -> z
@@ -301,8 +298,9 @@ class LatentSyncModule(nn.Module):
 
         # 3 Write:  information z -> s
         o_write, _ = self.write_attn(s_dense, z_proc, z_proc)
-        s_new_dense = s_dense + self.write_mlp(o_write) # [B, N_max, node_dim]
         
+        s_new_dense = s_dense + self.write_mlp(o_write) # [B, N_max, node_dim]  #norms = torch.linalg.vector_norm(self.write_mlp(o_write), ord=2, dim=(1, 2))
+
         # back to sparse
         s_new = s_new_dense[mask]
 
