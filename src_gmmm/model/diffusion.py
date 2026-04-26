@@ -21,6 +21,7 @@ class EquivariantDiffusion(nn.Module):
         n: int = 1, #latent recursion: number of latent recursion steps
         K: int = 2, #latent recursion: number of deep recursion steps
         eval_trm: Union[bool, int] = 0, #evaluation: number of batches to evaluate
+        latent_recursion_v2: bool = False, #latent recursion: whether to use latent recursion
     ):
         super().__init__()
 
@@ -34,6 +35,10 @@ class EquivariantDiffusion(nn.Module):
         self.n = n
         self.K = K 
         self.eval_trm = eval_trm
+        self.latent_recursion_v2 = latent_recursion_v2
+
+        if self.latent_recursion and self.latent_recursion_v2:
+            raise ValueError("Cannot use both latent_recursion and latent_recursion_v2")
 
     def loss_diffusion(self, t: torch.Tensor, batch: Batch | Data):
         latents, targets = self.training_targets(t=t, batch=batch)
@@ -81,6 +86,8 @@ class EquivariantDiffusion(nn.Module):
             
             # Run final iteration with tracking
             for i in range(self.n):
+                if torch.rand(1) < self.scprop:
+                    continue
                 preds = self.parameterization.forward(
                     t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
                     prev_preds=prev_preds, z_prev=z_prev
@@ -91,6 +98,23 @@ class EquivariantDiffusion(nn.Module):
                 t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
                 prev_preds=prev_preds, z_prev=z_prev
             )
+
+        elif self.latent_recursion_v2:
+            # Run final iteration with tracking
+            while torch.rand(1) < self.scprop:
+                preds = self.parameterization.forward(
+                    t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                    prev_preds=prev_preds, z_prev=z_prev
+                )
+                z_prev = preds.get("z", None)
+                if self.self_conditioning:
+                    prev_preds = {k: v for k, v in preds.items()} #just copy
+            
+            preds = self.parameterization.forward(
+                t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                prev_preds=prev_preds, z_prev=z_prev
+            )
+            
 
         else:
             preds = self.parameterization.forward(
@@ -280,7 +304,7 @@ class EquivariantDiffusion(nn.Module):
         z_intermediates = []
         z_prev = prev_preds.get("z", None) if prev_preds is not None else None
         
-        if self.latent_recursion:
+        if self.latent_recursion or self.latent_recursion_v2:
             for i in range(self.n):
                 preds = self.parameterization.forward(
                     t=t,

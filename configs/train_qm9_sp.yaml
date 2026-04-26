@@ -28,6 +28,7 @@ parameterization: "x0"
 # TRM / self-cond specific
 self_conditioning: true        #self-conditioning: whether to use self-conditioning 
 latent_recursion: true  #latent-recursion: whether to use latent recursion (ASSUMES self-conditioning == True)
+latent_recursion_v2: false #latent-recursion: whether to use latent recursion version 2 (while loop based)
 n: 1 #latent-recursion: REQUIREMENT n>=0, number of latent recursion steps
 K: 2 #deep-recursion: REQUIREMENT K>=2,number of deep recursion steps 
 M: 8 #latent-recursion: scratchpad number of tokens
@@ -69,6 +70,7 @@ lit_module:
     scprop: ${scprop}         #self-conditioning: probability of using self-conditioning (ONLY used when self_conditioning is true)
     self_conditioning: ${self_conditioning}
     latent_recursion: ${latent_recursion}
+    latent_recursion_v2: ${latent_recursion_v2}
     n: ${n}
     K: ${K}
     eval_trm: ${eval_trm}
@@ -91,6 +93,7 @@ lit_module:
         self_conditioning: ${self_conditioning}        #self-conditioning: whether to use self-conditioning 
         h_input_dim: 100 # all periodic table
         latent_recursion: ${latent_recursion} #latent-recursion: whether to use latent recursion
+        latent_recursion_v2: ${latent_recursion_v2} #latent-recursion: whether to use latent recursion v2
         M: ${M} #latent-recursion: height of scratchpad
         z_dim: ${z_dim} #latent-recursion: dimensionality of scratchpad
 

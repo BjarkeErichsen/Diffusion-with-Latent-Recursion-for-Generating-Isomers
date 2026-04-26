@@ -244,7 +244,7 @@ class RMSNorm(nn.Module):
 
 # latent recursion module
 class LatentSyncModule(nn.Module):
-    def __init__(self, node_dim: int, z_dim:int, num_heads: int = 4, num_blocks: int = 2, skip_transformer_block: bool = False):
+    def __init__(self, node_dim: int, z_dim:int, num_heads: int = 4, num_blocks: int = 2, skip_transformer_block: bool = True):
         super().__init__()
 
         self.node_dim, self.z_dim = node_dim, z_dim

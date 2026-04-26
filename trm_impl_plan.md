@@ -595,3 +595,5 @@ file: trm_utilities is added
 
 self.z_pe = SinusoidalPositionalEncoding(d_model=z_dim, max_len=M)
 
+
+### Phase 12: (baseline parameterizations) 

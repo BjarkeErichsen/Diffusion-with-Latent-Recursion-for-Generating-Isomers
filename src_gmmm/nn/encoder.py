@@ -140,6 +140,7 @@ class EquivEncoder(nn.Module):
         smooth_h: bool = True,
         self_conditioning: bool = False, #self-conditioning
         latent_recursion: bool = False, #latent recursion
+        latent_recursion_v2: bool = False, #latent recursion v2
         M: int = 8, #latent recursion: rows latent dimension
         z_dim: int = 64 #latent dimension: columns latent dimension
     ):
@@ -191,8 +192,8 @@ class EquivEncoder(nn.Module):
 
 
         #latent recursion
-        self.latent_recursion = latent_recursion
-        if latent_recursion:
+        self.latent_recursion = latent_recursion or latent_recursion_v2
+        if self.latent_recursion:
             # 1: initialization
             self.z_base = nn.Parameter(torch.randn(M, z_dim)* 0.02) #initialize z_base with small random values
              
@@ -258,7 +259,7 @@ class EquivEncoder(nn.Module):
                 num_graphs = node_index.max() + 1
                 Z_proc = self.z_base.unsqueeze(0).expand(num_graphs, -1, -1)
 
-                #Z_proc = Z_proc + self.z_pe() #positional encoding
+                Z_proc = Z_proc + self.z_pe() #positional encoding
 
                 z_original = Z_proc
             
@@ -287,7 +288,7 @@ class EquivEncoder(nn.Module):
             )
             node_states_s, node_states_v = update(node_states_s, node_states_v)
             
-            if self.latent_recursion: #: #Set to false to disable
+            if False: # self.latent_recursion: #: #Set to false to disable
                 Z_proc, node_states_s, node_states_v = sync_module(
                     z_old = Z_proc,
                     s = node_states_s,
