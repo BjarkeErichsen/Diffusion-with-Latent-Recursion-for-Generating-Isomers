@@ -86,7 +86,7 @@ class EquivariantDiffusion(nn.Module):
             
             # Run final iteration with tracking
             for i in range(self.n):
-                if torch.rand(1) < self.scprop:
+                if torch.rand(1) > self.scprop:
                     continue
                 preds = self.parameterization.forward(
                     t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
@@ -99,21 +99,21 @@ class EquivariantDiffusion(nn.Module):
                 prev_preds=prev_preds, z_prev=z_prev
             )
 
-        elif self.latent_recursion_v2:
-            # Run final iteration with tracking
-            while torch.rand(1) < self.scprop:
-                preds = self.parameterization.forward(
-                    t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
-                    prev_preds=prev_preds, z_prev=z_prev
-                )
-                z_prev = preds.get("z", None)
-                if self.self_conditioning:
-                    prev_preds = {k: v for k, v in preds.items()} #just copy
+        #elif self.latent_recursion_v2:
+        #    # Run final iteration with tracking
+        #    while torch.rand(1) < self.scprop:
+        #        preds = self.parameterization.forward(
+        #            t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+        #            prev_preds=prev_preds, z_prev=z_prev
+        #        )
+        #        z_prev = preds.get("z", None)
+        #        if self.self_conditioning:
+        #            prev_preds = {k: v for k, v in preds.items()} #just copy
             
-            preds = self.parameterization.forward(
-                t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
-                prev_preds=prev_preds, z_prev=z_prev
-            )
+        #    preds = self.parameterization.forward(
+        #        t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+        #        prev_preds=prev_preds, z_prev=z_prev
+        #    )
             
 
         else:
