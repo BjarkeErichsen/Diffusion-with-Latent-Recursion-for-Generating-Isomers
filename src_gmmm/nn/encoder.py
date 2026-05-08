@@ -7,6 +7,8 @@ from torch_scatter import scatter_sum
 from ..nn.layers import EdgeEmbedding, EquivLayerNorm, FourierEmbedding
 from ..nn.layers import SelfConditioningResidualLayer #self-conditioning
 from ..nn.layers import LatentSyncModule #latent-recursion
+from ..nn.layers import EdgeUpdateLayer #update edge states
+from ..nn.layers import RMSNorm 
 from ..utils.trm_utilities import SinusoidalPositionalEncoding #latent-recursion
 
 class InteractionLayer(nn.Module):
@@ -142,7 +144,9 @@ class EquivEncoder(nn.Module):
         latent_recursion: bool = False, #latent recursion
         latent_recursion_v2: bool = False, #latent recursion v2
         M: int = 8, #latent recursion: rows latent dimension
-        z_dim: int = 64 #latent dimension: columns latent dimension
+        z_dim: int = 64, #latent dimension: columns latent dimension
+        update_edge_states: bool = False, #update edge states
+        ablations: dict = None #ablations dict
     ):
         super(EquivEncoder, self).__init__()
 
@@ -182,31 +186,59 @@ class EquivEncoder(nn.Module):
 
         #self-conditioning #TODO: add h-dim for h-conditioning
         self.self_conditioning = self_conditioning
+        self.ablations = ablations if ablations is not None else {}
         if self_conditioning:
             self.sc_layer = SelfConditioningResidualLayer(
                 node_dim = hidden_dim, 
-                edge_dim = edge_embedding.out_features
+                edge_dim = edge_embedding.out_features,
+                ablations = self.ablations
             )
             
-            self.v_mlp = nn.Linear(hidden_dim, hidden_dim) #only used if we want to use v-conditioning
-
+            self.v_mlp = nn.Linear(hidden_dim, hidden_dim, bias=False) #only used if we want to use v-conditioning
 
         #latent recursion
         self.latent_recursion = latent_recursion or latent_recursion_v2
         if self.latent_recursion:
             # 1: initialization
-            self.z_base = nn.Parameter(torch.randn(M, z_dim)* 0.02) #initialize z_base with small random values
+            #self.z_base = nn.Parameter(torch.randn(M, z_dim)* 0.02) #initialize z_base with small random values
              
             # 2: latent recursion / sync layers. 
-            self.latent_sync_modules = nn.ModuleList([
-                LatentSyncModule(hidden_dim, z_dim) for _ in range(num_layers + 1) #+1 because we need a module as the primer
-            ]) 
+            #self.latent_sync_modules = nn.ModuleList([
+            #    LatentSyncModule(hidden_dim, z_dim) for _ in range(num_layers + 1) #+1 because we need a module as the primer
+            #]) 
 
             # 3: readout residual MLP
-            self.z_residual = nn.Linear(z_dim, z_dim)
+            #self.z_residual = nn.Linear(z_dim, z_dim)
             #nn.init.zeros_(self.z_residual.weight); nn.init.zeros_(self.z_residual.bias) #0 initialization
 
-            self.z_pe = SinusoidalPositionalEncoding(d_model=z_dim, max_len=M)
+            #self.z_pe = SinusoidalPositionalEncoding(d_model=z_dim, max_len=M)
+
+            self.s_sync = nn.Linear(hidden_dim, hidden_dim, bias=False) #lr v2
+            self.s_gat = nn.Linear(hidden_dim, hidden_dim)
+            #self.write_attn = nn.MultiheadAttention(embed_dim=hidden_dim, kdim=hidden_dim, vdim=hidden_dim, num_heads=4, batch_first=True)
+            self.v_sync = nn.Linear(hidden_dim, hidden_dim, bias=False) #lr v2
+            self.v_gat = nn.Linear(16, hidden_dim) # uncommented to avoid AttributeError
+            self.v_gat_s = nn.Linear(hidden_dim, hidden_dim)
+            self.edge_sync = nn.Linear(edge_embedding.out_features, edge_embedding.out_features, bias=False)
+
+
+            #these MLPs are DIFFERENT from those in self-cond, we dont just condition on the NORM of the difference, instead we give the ENTIRE RESIDUAL as input (hence hidden_dim*2 and not hidden_dim+1)
+            self.s_mlp = nn.Sequential(
+                nn.Linear(hidden_dim*2, hidden_dim, bias=False)
+            )
+
+            self.e_mlp = nn.Sequential(
+                nn.Linear(edge_embedding.out_features*2, edge_embedding.out_features, bias=False)
+            )
+
+            self.s_norm = RMSNorm(self.hidden_dim)
+            self.e_norm = RMSNorm(self.edge_embedding.out_features)
+
+
+        #update edge states
+        self.update_edge_states = update_edge_states
+        if update_edge_states:
+            self.edge_update_layer = EdgeUpdateLayer(self.hidden_dim, self.edge_embedding.out_features, architecture="layernorm")
 
     def forward(
         self,
@@ -228,10 +260,51 @@ class EquivEncoder(nn.Module):
         node_states_s = torch.cat([node_states_s, t_per_atom], dim=1)
         node_states_s = self.node_time_projection(node_states_s)
 
+
         edge_states, unit_vectors = self.edge_embedding.forward(
             positions=pos, edge_index=edge_node_index
         )
 
+        if self.latent_recursion:
+            if not z_prev is None: 
+
+                #baseline s, v
+                #node_states_s = node_states_s + self.s_sync(z_prev[0])
+                #node_states_v = node_states_v + self.v_sync(z_prev[1])
+
+                #GLU without v
+                #node_states_s = node_states_s + self.s_sync(z_prev[0]) * torch.sigmoid(self.s_gat(node_states_s))
+
+                #Multihead attention s
+                #node_states_s = node_states_s + self.write_attn(query=node_states_s, key=z_prev, value=z_prev)[0]
+
+                #SwiGLU s
+                #node_states_s = node_states_s + self.s_sync(z_prev[0]) * torch.sigmoid(self.s_gat(node_states_s)) * self.s_gat(node_states_s) 
+
+                #GLU with s and v
+                #node_states_s = node_states_s + self.s_sync(z_prev[0]) * torch.sigmoid(self.s_gat(node_states_s))
+                #node_states_v = node_states_v + self.v_sync(z_prev[1]) * torch.sigmoid(self.v_gat_s(z_prev[0])).unsqueeze(1)  #new to test
+
+                #normalized GLU with s and v: We normalize via RMS norm instead of variance=1 and mean=0; note we normalize across both the 3xhidden_dim dimension in 1 operation for v to not break equivariance. 
+                #node_states_s = node_states_s + self.s_sync(z_prev[0]) * torch.sigmoid(self.s_gat(node_states_s))
+                #node_states_v = node_states_v + self.v_sync(z_prev[1]) * torch.sigmoid(self.v_gat_s(z_prev[0])).unsqueeze(1)  #new to test
+
+
+                #baseline s, v edge_embed
+                #node_states_s = node_states_s + self.s_sync(z_prev[0])
+                #node_states_v = node_states_v + self.v_sync(z_prev[1]) #torch.Size([109, 3, 256])
+                #edge_states = edge_states + self.edge_sync(z_prev[2]) #torch.Size([1460, 65])
+                
+
+                #residual for s and edge_states
+                s_residual = node_states_s - z_prev[0] #entire residual, not just norm of residual
+                s_concat = torch.cat([node_states_s, s_residual], dim=-1)
+                node_states_s = node_states_s + self.s_norm(self.s_mlp(s_concat))
+                e_residual = edge_states - z_prev[2] #entire residual, not just norm of residual
+                e_concat = torch.cat([edge_states, e_residual], dim=-1)
+                edge_states = edge_states + self.e_norm(self.e_mlp(e_concat)) #this breaks equivariance
+                node_states_v = node_states_v + self.v_sync(z_prev[1]) #
+                 
         #self-conditioning: update node and edge states with previous predictions. Done BEFORE interaction and update layers.
         if self.self_conditioning and prev_preds is not None:
             node_states_s, edge_states = self.sc_layer.forward(
@@ -242,42 +315,39 @@ class EquivEncoder(nn.Module):
                 node_index = node_index, 
                 edge_node_index = edge_node_index,
             )
-            #method 1
-            v = (pos - prev_preds["pos"]) / (torch.norm(pos - prev_preds["pos"], dim=-1, keepdim=True) + 1e-12) 
-            v = v.unsqueeze(-1).expand(-1, -1, self.hidden_dim) # v (N x 3) -> (N x 3 x F) 
-            node_states_v = self.v_mlp(v)
+            if not self.ablations.get("ablate_v", False):
+                #method 1
+                v = (pos - prev_preds["pos"]) / (torch.norm(pos - prev_preds["pos"], dim=-1, keepdim=True) + 1e-12) 
+                v = v.unsqueeze(-1).expand(-1, -1, self.hidden_dim) # v (N x 3) -> (N x 3 x F) 
+                node_states_v = self.v_mlp(v)
             
-            # #TODO method 2
-            #src, dst = edge_node_index
-            #node_states_v = torch.norm(prev_preds["pos"][src] - prev_preds["pos"][dst], dim=-1, keepdim=True)
-
         #latent recursion: initialize z_prev and run primer
-        Z_proc = z_prev
-        z_original = z_prev
-        if self.latent_recursion:
-            if z_prev is None:
-                num_graphs = node_index.max() + 1
-                Z_proc = self.z_base.unsqueeze(0).expand(num_graphs, -1, -1)
+        #Z_proc = z_prev
+        #z_original = z_prev
+        #if self.latent_recursion:
+            
+            #if z_prev is None:
+                #num_graphs = node_index.max() + 1
+                #Z_proc = self.z_base.unsqueeze(0).expand(num_graphs, -1, -1)
 
-                Z_proc = Z_proc + self.z_pe() #positional encoding
+                #Z_proc = Z_proc + self.z_pe() #positional encoding
 
-                z_original = Z_proc
+            #z_original = Z_proc
             
             #primer (using module 1)
-            Z_proc, node_states_s, node_states_v = self.latent_sync_modules[0](
-                z_old = Z_proc,
-                s = node_states_s,
-                v = node_states_v,
-                node_index = node_index
-                )
-        
-        sync_modules = self.latent_sync_modules[1:] if self.latent_recursion else [None] * len(self.interactions) # latent recursion:we need this, otherwise running without latent recursion will throw an error
+            #Z_proc, node_states_s, node_states_v = self.latent_sync_modules[0](
+            #    z_old = Z_proc,
+            #    s = node_states_s,
+            #    v = node_states_v,
+            #    node_index = node_index
+            #    )
+            
+        #sync_modules = self.latent_sync_modules[1:] if self.latent_recursion else [None] * len(self.interactions) # latent recursion:we need this, otherwise running without latent recursion will throw an error
 
         for (
             interaction,
             update,
-            sync_module
-        ) in zip(self.interactions, self.updates, sync_modules):
+        ) in zip(self.interactions, self.updates): #, sync_modules
             node_states_s, node_states_v = interaction.forward(
                 node_states_s=node_states_s,
                 node_states_v=node_states_v,
@@ -288,19 +358,22 @@ class EquivEncoder(nn.Module):
             )
             node_states_s, node_states_v = update(node_states_s, node_states_v)
             
-            if False: # self.latent_recursion: #: #Set to false to disable
-                Z_proc, node_states_s, node_states_v = sync_module(
-                    z_old = Z_proc,
-                    s = node_states_s,
-                    v = node_states_v,
-                    node_index = node_index
-                )
+            if self.update_edge_states:
+                edge_states = self.edge_update_layer(edge_states, node_states_s, node_states_v, edge_node_index)
+
+            #if False: # self.latent_recursion: #: #Set to false to disable
+            #    Z_proc, node_states_s, node_states_v = sync_module(
+            #        z_old = Z_proc,
+            #        s = node_states_s,
+            #        v = node_states_v,
+            #        node_index = node_index
+            #    )
         
         states = {"s": node_states_s, "v": node_states_v}
         
         #latent recursion: final readout with residual connection
         if self.latent_recursion:
-            Z_next = z_original + self.z_residual(Z_proc)
-            states["z"] = Z_next
-
+            #Z_next = z_original + self.z_residual(Z_proc)
+            states["z"] = [node_states_s, node_states_v, edge_states]
+          
         return states

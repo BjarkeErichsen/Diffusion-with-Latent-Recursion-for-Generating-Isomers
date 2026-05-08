@@ -103,7 +103,7 @@ class EdgeEmbedding(nn.Module):
 
     def featurize_distances(self, distances: torch.Tensor):
         distances = torch.clamp(distances, 0.0, self.max_distance)
-        features = torch.exp((-((distances - self.offsets) ** 2)) / self.delta)
+        features = torch.exp((-((distances - self.offsets) ** 2)) / self.delta) #RBF: offsets is 64 values of mu
 
         if self.cutoff:
             features = features * cosine_cutoff(distances, cutoff=self.max_distance)
@@ -113,6 +113,47 @@ class EdgeEmbedding(nn.Module):
     @property
     def out_features(self):
         return self.num_rbf_features + 1
+
+
+class EdgeUpdateLayer(nn.Module):
+    """
+    Simple update: We just let edges reflect the new distances 
+    """
+    def __init__(self, hidden_dim: int, edge_dim: int, architecture: str="layernorm"):
+        super().__init__()
+
+        self.architecture = architecture
+
+        if self.architecture == "layernorm":
+            self.mlp = nn.Sequential(
+                nn.Linear(hidden_dim + 3, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, edge_dim)
+            )
+            
+        
+    def forward(self, edge_states, node_states_s, node_states_v, edge_index):
+        dest, source = edge_index
+
+        dest_v = node_states_v[dest]   # (n_edges, 3, z_dim)
+        source_v = node_states_v[source] # (n_edges, 3, z_dim)
+        source_s = node_states_s[source] # (n_edges, z_dim)
+        dest_s = node_states_s[dest] # (n_edges, z_dim)
+
+        if self.architecture == "layernorm":
+            #inner product of v: inner product enables the edge states to remain invariant to rotation!
+            #v = (N, 3, z_dim)
+            v_inv_between = torch.einsum('esh, esh -> e', dest_v, source_v)
+            v_inv_dest = torch.einsum('esh, esh -> e', dest_v, dest_v)
+            v_inv_src = torch.einsum('esh, esh -> e', source_v, source_v) 
+            # if v tells us where each atom will go, then dest_v * source_v gives us an indication of the they will go together. Similar direction etc. 
+            residual_s = dest_s - source_s
+
+            mlp_input = torch.cat([residual_s, v_inv_between.unsqueeze(-1), v_inv_dest.unsqueeze(-1), v_inv_src.unsqueeze(-1)], dim=-1)
+            gate = 2.0 * torch.sigmoid(self.mlp(mlp_input)) #we use * to let the model both amplify and diminish the signal 
+            edge_states = edge_states * gate
+        return edge_states
+
 
 
 class EquivLayerNorm(nn.Module):
@@ -158,16 +199,16 @@ class EquivLayerNorm(nn.Module):
         var = (s * s).mean(dim=-1, keepdim=True)
         var = scatter_mean(var, index, dim=0, dim_size=batch_size)
         var = torch.clamp(var, min=self.eps)
-        sout = s / var[index]
+        sout = s / torch.sqrt(var[index]) #modified from var[index]
 
         if self.affine and self.weight_s is not None and self.bias_s is not None:
             sout = sout * self.weight_s + self.bias_s
 
         if v is not None:
             vmean = torch.pow(v, 2).sum(dim=1, keepdim=True).mean(dim=-1, keepdim=True)
-            vmean = scatter_mean(vmean, index, dim=0, dim_size=batch_size)
-            vmean = torch.clamp(vmean, min=self.eps)
-            vout = v / vmean[index]
+            vmean = scatter_mean(vmean, index, dim=0, dim_size=batch_size) #vmean -> (n_graphs, 1, 1)
+            vmean = torch.clamp(vmean, min=self.eps) 
+            vout = v / torch.sqrt(vmean[index]) #modified from vmean[index]
 
         else:
             vout = None
@@ -179,8 +220,9 @@ class EquivLayerNorm(nn.Module):
 
 #self-conditioning: residual layer that takes previous predictions as input
 class SelfConditioningResidualLayer(nn.Module):
-    def __init__(self, node_dim: int, edge_dim: int):
+    def __init__(self, node_dim: int, edge_dim: int, ablations: dict = None):
         super().__init__()
+        self.ablations = ablations if ablations is not None else {}
 
         self.node_mlp = nn.Sequential(
             nn.Linear(node_dim + 1, node_dim),
@@ -194,39 +236,37 @@ class SelfConditioningResidualLayer(nn.Module):
             nn.Linear(edge_dim, edge_dim)
         )
 
-        
-
     def forward(self, node_states_s, edge_states, pos , prev_preds, node_index, edge_node_index):
         prev_pos = prev_preds["pos"]
         #prev_h = prev_preds["h"] #TODO: add this back when we start using diffusion_h
 
-        #Nodoes s
-        # difference of positions of the same atoms in X_t and X_1 #strategy used by both FlowMol and Harmonic
-        node_dist = torch.norm(pos - prev_pos, dim=-1, keepdim=True) 
+        if not self.ablations.get("ablate_s", False):
+            #Nodoes s
+            # difference of positions of the same atoms in X_t and X_1 #strategy used by both FlowMol and Harmonic
+            node_dist = torch.norm(pos - prev_pos, dim=-1, keepdim=True) 
 
-        #concat current node state, hte predicted h node states and the predicted distance
-        node_resid_input = torch.cat([node_states_s, node_dist], dim=-1) #TODO: add prev_h when we start using diffusion_h
-        node_states_s = node_states_s + self.node_mlp(node_resid_input) #map back to dim of s 
+            #concat current node state, hte predicted h node states and the predicted distance
+            node_resid_input = torch.cat([node_states_s, node_dist], dim=-1) #TODO: add prev_h when we start using diffusion_h
+            node_states_s = node_states_s + self.node_mlp(node_resid_input) #map back to dim of s 
 
-        #Edges e
-        src, dst = edge_node_index
-        
-        #eucledian length of edges in X_t
-        curr_edge_dist = torch.norm(pos[src] - pos[dst], dim=-1, keepdim=True)
-         
-        #eucledian length of edges in X_1 
-        prev_edge_dist = torch.norm(prev_pos[src] - prev_pos[dst], dim=-1, keepdim=True)
-        
-        #difference in edge lengths of X_1 and X_t
-        edge_dist_diff = prev_edge_dist - curr_edge_dist 
+        if not self.ablations.get("ablate_edge", False):
+            #Edges e
+            src, dst = edge_node_index
+            
+            #eucledian length of edges in X_t
+            curr_edge_dist = torch.norm(pos[src] - pos[dst], dim=-1, keepdim=True)
+             
+            #eucledian length of edges in X_1 
+            prev_edge_dist = torch.norm(prev_pos[src] - prev_pos[dst], dim=-1, keepdim=True)
+            
+            #difference in edge lengths of X_1 and X_t
+            edge_dist_diff = prev_edge_dist - curr_edge_dist 
 
-        #MLP(concat(edge_states, edge_dist_diff)) + edge states
-        edge_resid_input = torch.cat([edge_states, edge_dist_diff], dim=-1)
-        edge_states = edge_states + self.edge_mlp(edge_resid_input)
+            #MLP(concat(edge_states, edge_dist_diff)) + edge states
+            edge_resid_input = torch.cat([edge_states, edge_dist_diff], dim=-1)
+            edge_states = edge_states + self.edge_mlp(edge_resid_input)
 
         return node_states_s, edge_states
-
-
 
 
 #ONLY scaling, no bias

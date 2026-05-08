@@ -29,12 +29,18 @@ parameterization: "x0"
 self_conditioning: true        #self-conditioning: whether to use self-conditioning 
 latent_recursion: true  #latent-recursion: whether to use latent recursion (ASSUMES self-conditioning == True)
 latent_recursion_v2: false #latent-recursion: whether to use latent recursion version 2 (while loop based)
+update_edge_states: false #update edge states
 n: 1 #latent-recursion: REQUIREMENT n>=0, number of latent recursion steps
 K: 2 #deep-recursion: REQUIREMENT K>=2,number of deep recursion steps 
 M: 8 #latent-recursion: scratchpad number of tokens
 z_dim: 64 #64 #latent-recursion: scratchpad latent dim
 eval_trm: 0 #number of trajectories to save per validation run
-scprop: 0.5 #self-conditioning and latent recursion: probability of using self-conditioning and latent recursion (ONLY used when self_conditioning is true)
+scprop: 0.5 #self-conditioning and latent recursion: 1 means no skipping 0 means all skipping. We SKIP if rand(1) > scprop
+
+ablations:
+  ablate_s: false
+  ablate_v: false
+  ablate_edge: false
 
 # validation
 monitor_metric: "val/molecule_stable"
@@ -94,8 +100,10 @@ lit_module:
         h_input_dim: 100 # all periodic table
         latent_recursion: ${latent_recursion} #latent-recursion: whether to use latent recursion
         latent_recursion_v2: ${latent_recursion_v2} #latent-recursion: whether to use latent recursion v2
+        update_edge_states: ${update_edge_states}
         M: ${M} #latent-recursion: height of scratchpad
         z_dim: ${z_dim} #latent-recursion: dimensionality of scratchpad
+        ablations: ${ablations}
 
       readout:
         _target_: src_gmmm.nn.readout.DataPointReadout

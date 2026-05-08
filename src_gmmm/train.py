@@ -7,14 +7,17 @@ from pytorch_lightning import Callback, Trainer
 from pytorch_lightning.loggers import Logger
 
 from src_gmmm import utils
+import src_gmmm
 
 log = utils.get_pylogger(__name__)
 
 
 def train(cfg: DictConfig) -> Tuple[dict, dict]:
+    log.info(f"PROVENANCE: src_gmmm loaded from {src_gmmm.__file__}")
+
     if cfg.get("seed"):
         pl.seed_everything(cfg.seed, workers=True)
-
+    
     log.info(f"Instantiating datamodule <{cfg.datamodule.get('_target_')}>")
     datamodule: pl.LightningDataModule = hydra.utils.instantiate(cfg.datamodule)
 

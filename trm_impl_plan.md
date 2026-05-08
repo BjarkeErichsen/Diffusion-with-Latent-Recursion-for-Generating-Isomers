@@ -597,3 +597,178 @@ self.z_pe = SinusoidalPositionalEncoding(d_model=z_dim, max_len=M)
 
 
 ### Phase 12: (baseline parameterizations) 
+
+
+### Phase 13: Use s instead of z in the TRM-g3m model
+CRITICAL: do not implement any code, only give a plan with the exact code i should add similar to the previous phases.
+
+We want to transfer the s representation learned in the previous step to the next step. This REPLACES the current z updates in the model, i.e. 
+`latent_states = s`.
+
+Currently, we will only use the s_t-1 representation to (help) initialize the s reprsentation of the next layer iteration (s_t) 
+
+As this replaces the current z-updates, we will use the same meta variables, fx we will replace the layer that currently controls z updates with a layer that controls s updates and uses it for the same purpose as z is currently used. 
+#for good order just comment out current z -specific code. 
+
+In short, make as few changes as possible, replacing z with s_prev, and construct a simple linearl ayer that helps the previous s be usefull for initializing the next s. 
+
+Dont implement any fancyness like cross attention as was done with z, also this will still be called latent-recursion and be controlled by the same variables in the config.
+
+**Target File:** `src_gmmm/nn/encoder.py`  
+**Where:** `EquivEncoder.__init__` and `EquivEncoder.forward`  
+**Action:** Replace `z`-specific logic with `s_prev` logic. Comment out `z` initialization and `LatentSyncModule` instantiations. Introduce a simple linear layer `self.s_sync` to process `s_prev` (which is passed down using the existing `z_prev` argument). In the `forward` pass, apply `self.s_sync(z_prev)` to `node_states_s`. Finally, return `node_states_s` under the `z` key so that it seamlessly loops back into the next iteration as `z_prev`.
+
+```python
+# [EXISTING CODE] - __init__
+        #latent recursion
+        self.latent_recursion = latent_recursion or latent_recursion_v2
+        if self.latent_recursion:
+            # 1: initialization
+# [NEW CODE] - Comment out z-specific initialization and add s_sync
+            # self.z_base = nn.Parameter(torch.randn(M, z_dim)* 0.02) #initialize z_base with small random values
+             
+            # 2: latent recursion / sync layers. 
+            # self.latent_sync_modules = nn.ModuleList([
+            #     LatentSyncModule(hidden_dim, z_dim) for _ in range(num_layers + 1) #+1 because we need a module as the primer
+            # ]) 
+
+            # 3: readout residual MLP
+            # self.z_residual = nn.Linear(z_dim, z_dim)
+            # nn.init.zeros_(self.z_residual.weight); nn.init.zeros_(self.z_residual.bias) #0 initialization
+
+            # self.z_pe = SinusoidalPositionalEncoding(d_model=z_dim, max_len=M)
+            
+            # Simple linear layer to help the previous s be useful for initializing the next s
+            self.s_sync = nn.Linear(hidden_dim, hidden_dim)
+```
+
+```python
+# [EXISTING CODE] - forward Execution Start
+        #latent recursion: initialize z_prev and run primer
+        Z_proc = z_prev
+        z_original = z_prev
+        if self.latent_recursion:
+# [NEW CODE] - Comment out z primer, inject s_prev directly into node_states_s
+            # if z_prev is None:
+            #     num_graphs = node_index.max() + 1
+            #     Z_proc = self.z_base.unsqueeze(0).expand(num_graphs, -1, -1)
+            #
+            #     Z_proc = Z_proc + self.z_pe() #positional encoding
+            #
+            #     z_original = Z_proc
+            # 
+            # #primer (using module 1)
+            # Z_proc, node_states_s, node_states_v = self.latent_sync_modules[0](
+            #     z_old = Z_proc,
+            #     s = node_states_s,
+            #     v = node_states_v,
+            #     node_index = node_index
+            #     )
+
+            # z_prev is now acting as s_prev
+            if z_prev is not None:
+                node_states_s = node_states_s + self.s_sync(z_prev)
+                
+# [EXISTING CODE] - Iterative Interaction Loop
+        # sync_modules = self.latent_sync_modules[1:] if self.latent_recursion else [None] * len(self.interactions) # latent recursion:we need this, otherwise running without latent recursion will throw an error
+
+# [NEW CODE] - Standard loop (removing sync_modules from zip)
+        for (
+            interaction,
+            update
+        ) in zip(self.interactions, self.updates):
+# [EXISTING CODE]
+            node_states_s, node_states_v = interaction.forward(
+                node_states_s=node_states_s,
+                node_states_v=node_states_v,
+                edge_states=edge_states,
+                unit_vectors=unit_vectors,
+                node_index=node_index,
+                edge_node_index=edge_node_index,
+            )
+            node_states_s, node_states_v = update(node_states_s, node_states_v)
+            
+# [NEW CODE] - Comment out sync_module call inside loop
+            # if False: # self.latent_recursion: #: #Set to false to disable
+            #     Z_proc, node_states_s, node_states_v = sync_module(
+            #         z_old = Z_proc,
+            #         s = node_states_s,
+            #         v = node_states_v,
+            #         node_index = node_index
+            #     )
+        
+        states = {"s": node_states_s, "v": node_states_v}
+        
+# [EXISTING CODE] - Readout
+        #latent recursion: final readout with residual connection
+        if self.latent_recursion:
+# [NEW CODE] - Return current s to be used as s_prev (z_prev) in the next iteration
+            # Z_next = z_original + self.z_residual(Z_proc)
+            # states["z"] = Z_next
+            
+            # We replace z with s_prev. Outputting it as "z" routes it seamlessly through diffusion.py
+            states["z"] = node_states_s 
+
+        return states
+```
+
+### Phase 14: Removal of Legacy Tracking & Code Cleanup
+**Target Files:** `configs/train_qm9_sp.yaml`, `src_gmmm/nn/encoder.py`, `src_gmmm/model/diffusion.py`, `src_gmmm/utils/trm_eval.py`  
+**Action:** Before implementing the new tracking mechanism, clean up the codebase to remove deprecated features.
+- **Remove `eval_trm`**: Strip out all config parameters, model logic, and callback logic related to `eval_trm`.
+- **Remove `latent_recursion_v2`**: Remove `latent_recursion_v2` from `configs/train_qm9_sp.yaml`, `src_gmmm/nn/encoder.py`, and any other locations. Remove unneeded parameter initializations (e.g. inside the old `latent_recursion_v2` blocks).
+
+### Phase 15: Design Options for Scalable Internal Representation Tracking
+Tracking internal representations efficiently without suffocating disk space or slowing down training is a common challenge in deep learning research. Below are 3 designs ranging from basic to highly professional/scalable.
+
+#### Level 1: Config-Driven Manual Context (Basic Professionalism)
+*Best for: Rapid prototyping, single-node training, small-to-medium graphs.*
+
+**How it works:**
+Introduce a `Tracker` singleton or context object passed down through the model. In the config, specify exactly which variables to track (e.g., `track_vars: ["node_states_s", "edge_states"]`) and a sampling frequency (e.g., `track_frequency: "val_first_batch"`).
+In the model code, manually add hooks: 
+```python
+if self.tracker.should_track("node_states_s"):
+    self.tracker.log("node_states_s", node_states_s)
+```
+**Storage:** 
+The `Tracker` aggregates these tensors in RAM until the batch/trajectory ends, then dumps them using `torch.save()` into an organized hierarchy:
+`output_dir/representations/epoch_005/val_batch_0/node_states_s.pt`
+
+**Pros:** Extremely simple to implement; highly transparent; easy to debug.
+**Cons:** Clutters model code with `if` statements; synchronous disk I/O can cause minor training stalls.
+
+#### Level 2: PyTorch Forward Hooks & Lightning Callbacks (Intermediate Scalability)
+*Best for: Clean model code, complex architectures, standard research workflows.*
+
+**How it works:**
+Instead of modifying the core model logic, use PyTorch's native `register_forward_hook`. Create a PyTorch Lightning Callback called `RepresentationTrackerCallback`. 
+In the config, map module names to the variables you want:
+```yaml
+tracking:
+  frequency: "val_every_5_epochs"
+  modules:
+    "encoder.interactions.0": ["output"]
+    "encoder.sc_layer": ["input", "output"]
+```
+The callback attaches hooks to these specific modules *only* when the frequency condition is met. 
+
+**Storage:** 
+When the hook fires, it moves the data to CPU asynchronously and queues it to a background thread. The background thread saves the data into HDF5 (`.h5`) format or chunked `.pt` files inside an organized representations folder.
+
+**Pros:** Zero modification to core model forward passes (perfect separation of concerns); no overhead when not tracking; HDF5 is highly structured.
+**Cons:** HDF5 can sometimes be tricky with variable-sized PyG graphs; attaching/detaching hooks requires careful lifecycle management.
+
+#### Level 3: Asynchronous Telemetry Probes with Chunked Zarr/WebDataset (High Professionalism/MLOps)
+*Best for: Massive scale, multi-node distributed training, terabytes of representation data.*
+
+**How it works:**
+Implement a Publisher-Subscriber telemetry system. The model emits lightweight signals: `Probe.emit("encoder/node_s", tensor)`. 
+A dedicated background daemon (running on a separate thread or process) subscribes to these probes. If the current batch isn't targeted for saving, the `emit` is a no-op (near zero overhead). 
+
+**Storage:**
+The daemon writes data asynchronously using **Zarr** or **WebDataset** formats. The directory structure operates like a database:
+`output_dir/telemetry.zarr/epochs/005/encoder/node_s/...`
+
+**Pros:** Completely asynchronous (never blocks the GPU); scales to infinite data sizes; standard format used by data engineers; highly optimized parallel reads.
+**Cons:** Significant engineering effort up front; overkill if you only want to look at a few tensors occasionally.
