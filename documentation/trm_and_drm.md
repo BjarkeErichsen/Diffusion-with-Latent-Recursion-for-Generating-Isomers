@@ -772,3 +772,372 @@ The daemon writes data asynchronously using **Zarr** or **WebDataset** formats. 
 
 **Pros:** Completely asynchronous (never blocks the GPU); scales to infinite data sizes; standard format used by data engineers; highly optimized parallel reads.
 **Cons:** Significant engineering effort up front; overkill if you only want to look at a few tensors occasionally.
+
+### Phase 16: Level 2 Tracker Implementation (Elaborated)
+
+To make PyTorch's `register_forward_hook` robust and avoid the complexities of inspecting internal `kwargs` or tuple outputs of existing layers (especially when dealing with PyG's `node_index`), we introduce an explicit `RepresentationProbe` layer. This is essentially an identity layer that acts as a clean anchor point for our hooks, guaranteeing we have access to both the features and the graph topology (`node_index`).
+
+**Target File:** `src_gmmm/nn/layers.py` (or directly in `encoder.py`)  
+**Action:** Define the `RepresentationProbe` which passes data through unmodified.
+
+```python
+# [NEW CODE] - Add Probe Definition
+import torch.nn as nn
+
+class RepresentationProbe(nn.Module):
+    """
+    Dummy layer used purely as an anchor for PyTorch forward hooks.
+    Takes the tensor and its batch index, returning the tensor unmodified.
+    """
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, x, node_index=None):
+        return x
+```
+
+**Target File:** `src_gmmm/nn/encoder.py`  
+**Where:** `EquivEncoder.__init__` and `EquivEncoder.forward`  
+**Action:** Instantiate probes for the specific locations you wish to track, and insert them into the forward pass.
+
+```python
+# [EXISTING CODE] - __init__
+# ...
+        #update edge states
+        self.update_edge_states = update_edge_states
+        if update_edge_states:
+            self.edge_update_layer = EdgeUpdateLayer(self.hidden_dim, self.edge_embedding.out_features, architecture="layernorm")
+
+# [NEW CODE] - Add Tracking Probes
+        self.probes = nn.ModuleDict({
+            "post_sc_s": RepresentationProbe(),
+            "post_sc_v": RepresentationProbe(),
+            "layer_0_s": RepresentationProbe(),
+            "layer_0_v": RepresentationProbe(),
+            # Add more as needed...
+        })
+```
+
+```python
+# [EXISTING CODE] - forward
+        #self-conditioning: update node and edge states with previous predictions. Done BEFORE interaction and update layers.
+        if self.self_conditioning and prev_preds is not None:
+            # ... sc_layer forward ...
+            if not self.ablations.get("ablate_v", False):
+                # ...
+                node_states_v = self.v_mlp(v)
+                
+# [NEW CODE] - Explicitly Probe intermediate states
+            node_states_s = self.probes["post_sc_s"](node_states_s, node_index)
+            node_states_v = self.probes["post_sc_v"](node_states_v, node_index)
+
+# [EXISTING CODE] - Interaction Loop
+        for i, (
+            interaction,
+            update,
+        ) in enumerate(zip(self.interactions, self.updates)):
+            node_states_s, node_states_v = interaction.forward(
+                # ...
+            )
+            node_states_s, node_states_v = update(node_states_s, node_states_v)
+            
+            if self.update_edge_states:
+                edge_states = self.edge_update_layer(edge_states, node_states_s, node_states_v, edge_node_index)
+
+# [NEW CODE] - Probe inside the loop (e.g., just for layer 0)
+            if i == 0:
+                node_states_s = self.probes["layer_0_s"](node_states_s, node_index)
+                node_states_v = self.probes["layer_0_v"](node_states_v, node_index)
+```
+
+**Target File:** `src_gmmm/utils/tracking.py`  
+**Action:** Create the `RepresentationTrackerCallback` to attach to these explicit probes. Because the probe receives `(x, node_index)`, we can optionally reshape it to a dense batch before saving, making it much easier to analyze later.
+
+```python
+# [NEW CODE] - Create new file src_gmmm/utils/tracking.py
+import torch
+import pytorch_lightning as pl
+import threading
+import queue
+import os
+from torch_geometric.utils import to_dense_batch
+
+class RepresentationTrackerCallback(pl.Callback):
+    def __init__(self, frequency: str = "none", modules: dict = None):
+        super().__init__()
+        self.frequency = frequency
+        self.modules_cfg = modules or {}
+        self.save_queue = queue.Queue()
+        self.hooks = []
+        self.epoch = 0
+        self.batch_idx = 0
+        
+        self.saver_thread = threading.Thread(target=self._save_worker, daemon=True)
+        self.saver_thread.start()
+
+    def _save_worker(self):
+        while True:
+            item = self.save_queue.get()
+            if item is None: break
+            filepath, data = item
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            torch.save(data, filepath)
+            self.save_queue.task_done()
+            
+    def _get_hook(self, module_name):
+        # We use with_kwargs=True if PyTorch >= 2.0, but to be safe for older versions,
+        # we assume Probe receives (x, node_index) as positional args if passed that way,
+        # or we just grab the output.
+        def hook(module, inputs, output):
+            x = output.detach().cpu()
+            
+            # If node_index was passed as the second positional argument to the probe:
+            if len(inputs) > 1 and inputs[1] is not None:
+                node_index = inputs[1].detach().cpu()
+                # Optional: Convert to dense batch so it's [Batch_Size, Max_Nodes, Features]
+                # data, mask = to_dense_batch(x, node_index)
+                data = {"x": x, "node_index": node_index}
+            else:
+                data = x
+                
+            filepath = os.path.join(self.output_dir, f"epoch_{self.epoch:03d}", f"batch_{self.batch_idx}", f"{module_name}.pt")
+            self.save_queue.put((filepath, data))
+        return hook
+
+    def on_validation_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx=0):
+        self.epoch = trainer.current_epoch
+        self.batch_idx = batch_idx
+        log_dir = trainer.logger.save_dir if trainer.logger else "."
+        name = trainer.logger.name if trainer.logger and trainer.logger.name else "run"
+        self.output_dir = os.path.join(log_dir, name, "representations")
+        
+        if self.frequency == "val_first_batch" and batch_idx == 0:
+            should_track = True
+        elif self.frequency.startswith("val_every_") and "epochs" in self.frequency:
+            n = int(self.frequency.split("_")[2])
+            should_track = (self.epoch % n == 0) and (batch_idx == 0)
+        else:
+            should_track = False
+
+        if should_track:
+            for name, module in pl_module.named_modules():
+                # E.g., name might be "model.parameterization.encoder.probes.post_sc_s"
+                if any(k in name for k in self.modules_cfg):
+                    # Clean the filename up based on the probe name
+                    clean_name = name.split(".")[-1] 
+                    h = module.register_forward_hook(self._get_hook(clean_name))
+                    self.hooks.append(h)
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        for h in self.hooks:
+            h.remove()
+        self.hooks = []
+
+    def on_train_end(self, trainer, pl_module):
+        self.save_queue.put(None)
+        self.saver_thread.join()
+```
+
+**Target File:** `configs/train_qm9_sp.yaml`  
+**Action:** Map the tracker to our explicit probes.
+
+```yaml
+# [EXISTING CODE]
+callbacks:
+  model_checkpoint:
+    # ... 
+    
+# [NEW CODE] - Append to callbacks
+  representation_tracker:
+    _target_: src_gmmm.utils.tracking.RepresentationTrackerCallback
+    frequency: "val_every_5_epochs" 
+    modules:
+      - "probes.post_sc_s"
+      - "probes.layer_0_s"
+```
+
+
+
+
+
+
+
+
+
+
+
+# Denoising Recursion Model (DRM) Implementation Overview
+
+This document provides a detailed breakdown of the fundamental elements of the Denoising Recursion Model (DRM), expanding on the internal mechanics of the denoising process, the handling of timesteps, and the exact flow of latent states.
+
+## 1. Denoising Mechanism (Hierarchical Recursion)
+The fundamental engine of the DRM is not a simple linear loop, but a **hierarchical recurrent reasoning module** (defined in `models/recursive_reasoning/rm.py`). The model maintains two distinct latent states:
+1.  **`decode_latent`**: Represents the evolving solution grid (the target answer).
+2.  **`scratchpad_latent`**: A hidden workspace for intermediate computation.
+
+*   **The Unrolling Loops**:
+    The model unrolls its shared `RecurrentBlock` (a stack of Transformer/SwiGLU layers) in a nested loop defined by `H_cycles` (outer) and `L_cycles` / `grad_cycles` (inner).
+    *   **Inner Loop (Scratchpad Updates)**: For `L_cycles` iterations, the `scratchpad_latent` is updated by processing the current `decode_latent` and the fixed `input_embeddings`.
+    *   **Outer Loop (Decode Update)**: After the `L` scratchpad updates, the `decode_latent` is updated once by processing the finalized `scratchpad_latent`.
+*   **The Gradient Window ($k$ steps)**:
+    To manage memory and training stability, the model employs Truncated Backpropagation Through Time (TBPTT). 
+    *   The first `H_cycles - 1` outer loops are run inside a `torch.no_grad()` block (referred to as `warmup_cycles`).
+    *   Only the **final outer loop** (the last $L$ scratchpad updates and 1 decode update) is recorded with gradients. This final window is the "$k$ recursive denoising steps" supervised during training.
+    *   **Inference Behavior**: During inference, the model still executes the full $H \times L$ sequence of updates. The "window" concept is purely a training optimization for memory and gradient flow.
+
+## 2. Timestep Embeddings
+The DRM distinguishes between the inner recursion steps and the outer diffusion steps. A fundamental design choice of this model is that **time is entirely implicit**.
+
+*   **Within the Recursion Window ($k$ / $H, L$ cycles)**:
+    *   The model is **strictly time-invariant**. The `RecurrentBlock` applies identical weights at every step.
+    *   There is no explicit step counter, positional time encoding, or scalar injected into the hidden states to tell the model "which step" it is on. The progression of time is encoded purely in the evolving data within the `scratchpad_latent` and `decode_latent`.
+*   **Overall Denoising / Diffusion Timestep ($\tau$ or $i \in T$)**:
+    *   $\tau$ controls the **masking ratio** of the target grid (via `DiscreteScheduler` in `diffusion/schedulers.py`).
+    *   While the codebase contains a `_time_embedding` function designed to generate standard sinusoidal diffusion time encodings, **it is explicitly unused**.
+    *   The model is forced to be "noise-agnostic." It must infer the corruption level simply by observing the density of `MASK` tokens in the `decode_latent` and apply its universal denoising rules accordingly.
+
+## 3. Flow of States and Information
+The flow of information dictates how the problem input ($X$) and the noisy target ($Y$) are resolved into a clean output.
+
+### A. Initialization
+1.  **Input ($X$)**: The problem grid is embedded into fixed `input_embeddings`.
+2.  **Scratchpad**: Initialized from a learned static buffer (`scratchpad_init`).
+3.  **Decode Target**: 
+    *   *(Train)*: $Y_{target}$ is corrupted by masking a fraction of tokens based on a random $\tau$. This $Y_{noisy}$ is embedded to become the initial `decode_latent`.
+    *   *(Inference)*: Initialized as a fully masked grid ($Y_{fully\_masked}$).
+
+### B. Forward Process (Train & Inference Step)
+The core unrolling executes as follows:
+```text
+Loop H_cycles times:
+    Loop L_cycles times:
+        scratchpad_latent = Block(scratchpad_latent, decode_latent + input_embeddings)
+    decode_latent = Block(decode_latent, scratchpad_latent)
+```
+
+**Notation:**
+*   **$X$**: `input_embeddings` (The fixed problem/puzzle constraints).
+*   **$Y$**: `decode_latent` (The evolving target solution/grid).
+*   **$H$**: `scratchpad_latent` (The hidden workspace/reasoning memory).
+
+*   **Decoding**: The final `decode_latent` is passed through an `lm_head` to predict token logits (the clean grid $\hat{Y}$).
+*   *(Train only)*: Cross-entropy loss is applied between the logits and the uncorrupted $Y_{target}$.
+
+### C. Iterative Denoising Flow (Inference Only)
+During evaluation, the model runs the forward process $T$ times (defined by `diffusion_num_inference_steps`), chaining the states together:
+1.  **Predict**: Run the full $H \times L$ forward process to predict a completely filled grid $\hat{Y}_i$.
+2.  **Carry Over**: The finalized `scratchpad_latent` is **kept and passed** to the next timestep $i+1$, providing continuous memory across the denoising trajectory.
+3.  **Remask**: Based on the schedule for step $i+1$ (a lower noise ratio), a subset of the predicted tokens in $\hat{Y}_i$ are replaced with `MASK` tokens, generating $Y_{noisy, i+1}$.
+4.  **Re-embed**: This newly masked grid is embedded to form the fresh `decode_latent` for the next forward pass.
+5.  **Repeat**: This continues until $\tau = 0$ (no masks remaining).
+
+## 4. Specific Training vs. Inference Mechanics
+
+### A. Encoding the Step in the Window
+*   **Is the step encoded?** No. The progression of the loop (e.g., whether it is step 1 or step $L$ in the inner loop) is **not encoded** as a feature. The identical transformer block is applied recursively. 
+*   **Is it used during training (different from $\tau$)?** Because it is not encoded, the model does not explicitly "know" the difference between step 1 and step $L$. It differs fundamentally from $\tau$ in that $\tau$ determines the physical input state (how many `MASK` tokens are present) at the start of the window, whereas the window step is merely an internal unit of computation.
+
+### B. Re-masking During Training
+*   **Do we re-mask during training?** **No.** Re-masking is exclusively an inference-time mechanism used to bridge the gap between outer diffusion steps.
+*   **Training Behavior**: During training, a single random diffusion timestep $\tau$ is sampled per batch. The target grid $Y_{target}$ is masked once based on $\tau$ to create the initial `decode_latent`. The model then unrolls its full forward pass ($H \times L$ loops) operating entirely in the continuous latent space. It does not map back to discrete tokens and does not apply new masks midway through the training forward pass.
+
+### C. Decoding into $Y$ Directly
+*   **Do we apply the decoder to decode into $Y$ directly?** **Yes.** 
+*   **Implementation**: At the very end of the $H \times L$ recursive loops, the final `decode_latent` state is passed directly through a linear layer (`self.lm_head` in `rm.py`). This head projects the latent vectors directly into vocabulary logits representing the predicted clean grid $\hat{Y}$. 
+*   **Supervision**: These predicted logits are then directly compared against the fully uncorrupted ground truth tokens ($Y_{target}$) using a standard Cross-Entropy loss.
+
+## 5. Architecture and State Evolution
+
+This section details the explicit shapes and mathematical transfer equations for the latents as they move through the architecture.
+
+### Shape Variables
+*   **$B$**: Batch size.
+*   **$S$**: Sequence length. This is typically the flattened grid size $M$ (e.g., $30 \times 30 = 900$) plus the `puzzle_emb_len` (e.g., $16$), yielding $S = 916$.
+*   **$D$**: Hidden dimension (`hidden_size`).
+*   **$V$**: Vocabulary size (number of possible cell colors/states).
+
+Both primary latents—`scratchpad_latent` ($Z$) and `decode_latent` ($Y$)—maintain a constant shape of **`[B, S, D]`** throughout the entire forward process. The input sequence $X$ is also embedded into this shape.
+
+### Forward Pass Equations (Inner Recursion)
+During a single outer diffusion timestep $i$, the model updates its latents using the shared `RecurrentBlock` ($\Phi$). Let the superscript $(i, j)$ denote the state at diffusion step $i$ and inner-loop update $j$. 
+
+For each iteration $j$:
+1.  **Scratchpad Update**: The scratchpad absorbs the current target hypothesis and the fixed input constraints.
+    $$Z^{(i, j+1)} = \Phi(Z^{(i, j)}, \; Y^{(i, j)} + X_{embed})$$
+2.  **Decode Update**: The target hypothesis is refined using the updated scratchpad.
+    $$Y^{(i, j+1)} = \Phi(Y^{(i, j)}, \; Z^{(i, j+1)})$$
+
+### Carry Over Equations (Outer Denoising)
+At the end of the recursion window for diffusion timestep $i$ (let's denote the final inner step as $k$), we obtain the finalized latents $Z^{(i, k)}$ and $Y^{(i, k)}$. The model generates discrete predictions via the Linear Language Model Head:
+$$\hat{Y}^{(i)} = \text{argmax}(\text{LM\_Head}(Y^{(i, k)})) \quad \text{Shape: } [B, S]$$
+
+When moving to the next inference timestep $i+1$, the two latents are handled fundamentally differently:
+
+1.  **Scratchpad ($Z$) Carry Over**:
+    The scratchpad is passed forward perfectly untouched, providing continuous working memory.
+    $$Z^{(i+1, 0)} = Z^{(i, k)}$$
+
+2.  **Decode Latent ($Y$) Carry Over**:
+    The continuous decode representation is discarded. Instead, the discrete predictions $\hat{Y}^{(i)}$ are corrupted based on the next noise level $\tau_{i+1}$ and re-embedded from scratch.
+    $$Y_{noisy}^{(i+1)} = \text{Remask}(\hat{Y}^{(i)}, \; \tau_{i+1})$$
+    $$Y^{(i+1, 0)} = \text{Embed}(Y_{noisy}^{(i+1)})$$
+    *(Note: The `Remask` function preserves high-confidence predictions while injecting `MASK` tokens back into uncertain locations).*
+
+## 6. DRM Inference Pseudo-code (Advanced)
+
+**Notation:** $X$ = Input, $Y$ = Decode Latent, $H$ = Scratchpad Latent.
+
+*Note: During inference, the full $H \times L$ recursion depth is executed at every diffusion timestep $t$. The "gradient window" is a training-only optimization for memory.*
+
+The following pseudo-code describes the iterative denoising update during evaluation (inference), mapping the discrete re-masking logic back into the continuous latent space.
+
+```python
+# --- INITIALIZATION ---
+t_steps = scheduler.get_inference_timesteps()
+carry = model.initial_carry(batch) # Fully masked decode_latent
+puzzle_prefix = carry.decode_latent[:, :puzzle_len].clone()
+
+# --- DENOISING LOOP ---
+for t in t_steps:
+    # --- 1. INTERNAL RECURSION (The Depth Window) ---
+    # For every diffusion step t, we run the full H x L recursion.
+    for h in range(H_cycles):
+        for l in range(L_cycles):
+            # Update Scratchpad (H) using current Decode (Y) and Input (X)
+            carry.H = Block(carry.H, carry.Y + batch.X)
+        
+        # Update Decode (Y) using the finalized Scratchpad (H)
+        carry.Y = Block(carry.Y, carry.H)
+
+    # Decode continuous Y into discrete tokens for re-masking
+    logits = model.lm_head(carry.Y)
+    grid = argmax(logits) 
+    p_mask = t / total_train_timesteps
+
+    # 2. Denoising Update (Remasking)
+    if confidence_masking:
+        # Calculate how many tokens to 'forget' at this noise level
+        n_mask = int(p_mask * count_nonzero(grid))
+        
+        # Identity tokens model is least sure about
+        conf = softmax(logits).max(dim=-1)
+        
+        # Select 99% by lowest confidence, 1% random for exploration
+        target_indices = select_top_k(1.0 - conf, k=0.99 * n_mask)
+        target_indices += select_random(remaining, k=0.01 * n_mask)
+        
+        grid[target_indices] = MASK_TOKEN_ID
+    else:
+        # Simple uniform noise destruction
+        grid[random_uniform(shape(grid)) < p_mask] = MASK_TOKEN_ID
+
+    # 3. State Injection for next timestep
+    # We discard the continuous decode_latent but KEEP the scratchpad_latent
+    new_decode_latent = concat([puzzle_prefix, embed(grid)], dim=1)
+    
+    carry.recurrent_state = RecurrentState(
+        decode_latent=new_decode_latent,
+        scratchpad_latent=carry.recurrent_state.scratchpad_latent # Continuous memory
+    )
+```
+

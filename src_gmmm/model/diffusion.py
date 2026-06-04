@@ -7,7 +7,6 @@ from torch_geometric.utils import to_dense_batch
 
 from ..model.continuous import ContinuousDiffusion
 from ..model.score import EquivariantParameterization
-from ..utils.trm_eval import save_trm_eval_data
 
 class EquivariantDiffusion(nn.Module):
     def __init__(
@@ -20,8 +19,6 @@ class EquivariantDiffusion(nn.Module):
         latent_recursion: bool = False, #latent recursion: whether to use latent recursion
         n: int = 1, #latent recursion: number of latent recursion steps
         K: int = 2, #latent recursion: number of deep recursion steps
-        eval_trm: Union[bool, int] = 0, #evaluation: number of batches to evaluate
-        latent_recursion_v2: bool = False, #latent recursion: whether to use latent recursion
     ):
         super().__init__()
 
@@ -34,11 +31,6 @@ class EquivariantDiffusion(nn.Module):
         self.latent_recursion = latent_recursion
         self.n = n
         self.K = K 
-        self.eval_trm = eval_trm
-        self.latent_recursion_v2 = latent_recursion_v2
-
-        if self.latent_recursion and self.latent_recursion_v2:
-            raise ValueError("Cannot use both latent_recursion and latent_recursion_v2")
 
     def loss_diffusion(self, t: torch.Tensor, batch: Batch | Data):
         latents, targets = self.training_targets(t=t, batch=batch)
@@ -107,22 +99,7 @@ class EquivariantDiffusion(nn.Module):
                 prev_preds=prev_preds, z_prev=z_prev
             )
 
-        #elif self.latent_recursion_v2:
-        #    # Run final iteration with tracking
-        #    while torch.rand(1) < self.scprop:
-        #        preds = self.parameterization.forward(
-        #            t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
-        #            prev_preds=prev_preds, z_prev=z_prev
-        #        )
-        #        z_prev = preds.get("z", None)
-        #        if self.self_conditioning:
-        #            prev_preds = {k: v for k, v in preds.items()} #just copy
-            
-        #    preds = self.parameterization.forward(
-        #        t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
-        #        prev_preds=prev_preds, z_prev=z_prev
-        #    )
-            
+
 
         else:
             preds = self.parameterization.forward(
@@ -207,7 +184,6 @@ class EquivariantDiffusion(nn.Module):
         n_steps: int = 1000,
         ts: float = 1.0,
         tf: float = 1e-3,
-        eval_trm_override: Optional[bool] = None,
         epoch: int = -1,
         **kwargs,
     ) -> Union[
@@ -230,8 +206,6 @@ class EquivariantDiffusion(nn.Module):
         
         
         prev_preds = None  #self-conditioning: previous predictions
-        do_eval_trm = self.eval_trm if eval_trm_override is None else eval_trm_override
-
         for i in range(n_steps):
             t = ts[i]
             dt = ts[i + 1] - t
@@ -248,40 +222,7 @@ class EquivariantDiffusion(nn.Module):
                     node_index=node_index,
                     edge_node_index=edge_node_index,
                     prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
-                    eval_trm_override=do_eval_trm,
                 )
-            
-                if do_eval_trm:
-                    if i == 0: 
-                        eval_trm_data = {
-                            "X_t": {"pos": [], "h": []}, 
-                            "X_1": {"pos": [], "h": []}, 
-                            "Z": [],
-                            "val_datapoint": {"pos": to_dense_batch(batch.pos, batch.batch)[0].detach().cpu(), 
-                                              "h": to_dense_batch(batch.h, batch.batch)[0].detach().cpu(), 
-                                              "edge_node_index": batch.edge_node_index.detach().cpu(),
-                                              "mask": to_dense_batch(batch.pos, batch.batch)[1].detach().cpu()}
-                        }  #evaluation trm
-
-                    # Only record every 20 steps to save CPU RAM
-                    if i % 20 == 0 or i == n_steps - 1:
-                        if pos_t is not None:
-                            eval_trm_data["X_t"]["pos"].append(to_dense_batch(pos_t, node_index)[0].detach().cpu())
-                        
-                        if h_t is not None:
-                            eval_trm_data["X_t"]["h"].append(to_dense_batch(h_t, node_index)[0].detach().cpu())
-                            
-                        if prev_preds:
-                            if "pos" in prev_preds and prev_preds["pos"] is not None:
-                                eval_trm_data["X_1"]["pos"].append(to_dense_batch(prev_preds["pos"], node_index)[0].detach().cpu())
-                            if "h" in prev_preds and prev_preds["h"] is not None:
-                                eval_trm_data["X_1"]["h"].append(to_dense_batch(prev_preds["h"], node_index)[0].detach().cpu())
-                            
-                            eval_trm_data["Z"].append(prev_preds.get("z_intermediates", []))
-                    
-                    if i == n_steps - 1:
-                        save_trm_eval_data(eval_trm_data, epoch=epoch)
-
             if return_traj:
                 traj["pos"].append(pos_t)
                 traj["h"].append(h_t)
@@ -307,14 +248,12 @@ class EquivariantDiffusion(nn.Module):
         node_index: torch.Tensor,
         edge_node_index: torch.Tensor,
         prev_preds: Optional[dict[torch.Tensor, torch.Tensor]] = None, #self-conditioning: previous predictions
-        eval_trm_override: Optional[bool] = None,
     ):
-        do_eval_trm = self.eval_trm if eval_trm_override is None else eval_trm_override
         
         z_intermediates = []
         z_prev = prev_preds.get("z", None) if prev_preds is not None else None
         
-        if self.latent_recursion or self.latent_recursion_v2:
+        if self.latent_recursion:
             for i in range(self.n):
                 preds = self.parameterization.forward(
                     t=t,
@@ -326,11 +265,6 @@ class EquivariantDiffusion(nn.Module):
                     z_prev=z_prev, #latent recursion: pass previous latent states to the model
                 )
                 z_prev = preds.get("z", None)
-                if do_eval_trm and z_prev is not None:
-                    if isinstance(z_prev, list):
-                        z_intermediates.append([z.detach().cpu() for z in z_prev])
-                    else:
-                        z_intermediates.append(z_prev.detach().cpu())
         
         # get NN predictions
         preds = self.parameterization.forward(
@@ -342,12 +276,6 @@ class EquivariantDiffusion(nn.Module):
             prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
             z_prev=z_prev, #latent recursion: pass previous latent states to the model
         )
-        if do_eval_trm and "z" in preds:
-            if isinstance(preds["z"], list):
-                z_intermediates.append([z.detach().cpu() for z in preds["z"]])
-            else:
-                z_intermediates.append(preds["z"].detach().cpu())
-            preds["z_intermediates"] = z_intermediates
 
         # reverse step on each modality
         if self.diffusion_pos:

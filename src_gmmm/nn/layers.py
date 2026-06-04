@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch_scatter import scatter_mean
 from torch_geometric.utils import to_dense_batch
-
+from pytorch3d.ops import corresponding_points_alignment
 
 def cosine_cutoff(edge_distances: torch.Tensor, cutoff: float):
     return torch.where(
@@ -155,7 +155,6 @@ class EdgeUpdateLayer(nn.Module):
         return edge_states
 
 
-
 class EquivLayerNorm(nn.Module):
     def __init__(
         self,
@@ -217,37 +216,87 @@ class EquivLayerNorm(nn.Module):
 
         return out
 
-
 #self-conditioning: residual layer that takes previous predictions as input
 class SelfConditioningResidualLayer(nn.Module):
-    def __init__(self, node_dim: int, edge_dim: int, ablations: dict = None):
+    def __init__(self, node_dim: int, edge_dim: int, time_dim: int, max_distance: float = 8, ablations: dict = None):
         super().__init__()
+        self.node_dim = node_dim
+        self.max_distance = max_distance
         self.ablations = ablations if ablations is not None else {}
+        
+        
+        self.rbf_s_dim = 64
+        self.rbf_edge_dim = 16
 
         self.node_mlp = nn.Sequential(
-            nn.Linear(node_dim + 1, node_dim),
+            nn.Linear(node_dim + self.rbf_s_dim, node_dim),
             nn.SiLU(),
             nn.Linear(node_dim, node_dim) 
             )
 
         self.edge_mlp = nn.Sequential(
-            nn.Linear(edge_dim + 1, edge_dim),
+            nn.Linear(edge_dim + self.rbf_edge_dim, edge_dim),
             nn.SiLU(),
             nn.Linear(edge_dim, edge_dim)
         )
+        self.v_mlp = nn.Linear(node_dim, node_dim, bias=False) #only used if we want to use v-conditioning
+        
+        self.s_gate = nn.Sequential(
+            nn.Linear(time_dim, 1),
+            nn.Sigmoid()
+        )
+        self.v_gate = nn.Sequential(
+            nn.Linear(time_dim, 1),
+            nn.Sigmoid()
+        )
+        self.edge_gate = nn.Sequential(
+            nn.Linear(time_dim, 1),
+            nn.Sigmoid()
+        )
 
-    def forward(self, node_states_s, edge_states, pos , prev_preds, node_index, edge_node_index):
+        # RBF buffers
+        self.register_buffer("offsets_s", torch.linspace(0, max_distance, self.rbf_s_dim).unsqueeze(0))
+        self.register_buffer("offsets_edge", torch.linspace(0, max_distance, self.rbf_edge_dim).unsqueeze(0))
+        self.register_buffer("delta_s", torch.tensor(max_distance / self.rbf_s_dim))
+        self.register_buffer("delta_edge", torch.tensor(max_distance / self.rbf_edge_dim))
+
+
+    def featurize_distances(self, distances: torch.Tensor, offsets: torch.Tensor, delta: torch.Tensor):
+        distances = torch.clamp(distances, 0, self.max_distance)
+        return torch.exp(-((distances - offsets)**2) / delta)
+
+
+    def forward(self, node_states_s, node_states_v, edge_states, pos , prev_preds, node_index, edge_node_index, t, use_alignment=True):
         prev_pos = prev_preds["pos"]
         #prev_h = prev_preds["h"] #TODO: add this back when we start using diffusion_h
+
+        if use_alignment:
+            pos_dense, mask = to_dense_batch(pos, node_index)
+            prev_pos_dense, _ = to_dense_batch(prev_pos, node_index)
+            alignment = corresponding_points_alignment(
+                prev_pos_dense, 
+                pos_dense, 
+                weights=mask.float(), 
+                estimate_scale=False
+            )
+            prev_pos_dense_aligned = torch.bmm(prev_pos_dense, alignment.R) #+ alignment.T.unsqueeze(1)
+            prev_pos = prev_pos_dense_aligned[mask]
+
+        #tracking alignment properties
+        #R = alignment.R
+        #trace = torch.diagonal(input=R, dim1=-2, dim2=-1).sum(-1)
+        #cos_theta = ((trace - 1) / 2).clamp(-1.0, 1.0)
+        #theta = torch.acos(cos_theta)
+        #print(torch.abs(theta).mean())
+        #print(torch.abs(torch.norm(alignment.T.unsqueeze(1), dim=-1, keepdim=True)).mean())
 
         if not self.ablations.get("ablate_s", False):
             #Nodoes s
             # difference of positions of the same atoms in X_t and X_1 #strategy used by both FlowMol and Harmonic
             node_dist = torch.norm(pos - prev_pos, dim=-1, keepdim=True) 
-
-            #concat current node state, hte predicted h node states and the predicted distance
-            node_resid_input = torch.cat([node_states_s, node_dist], dim=-1) #TODO: add prev_h when we start using diffusion_h
-            node_states_s = node_states_s + self.node_mlp(node_resid_input) #map back to dim of s 
+            node_dist_rbf = self.featurize_distances(node_dist, self.offsets_s, self.delta_s)
+            node_resid_input = torch.cat([node_states_s, node_dist_rbf], dim=-1) #TODO: add prev_h when we start using diffusion_h
+            node_states_s = node_states_s + self.s_gate(t) * self.node_mlp(node_resid_input) #map back to dim of s 
 
         if not self.ablations.get("ablate_edge", False):
             #Edges e
@@ -255,18 +304,40 @@ class SelfConditioningResidualLayer(nn.Module):
             
             #eucledian length of edges in X_t
             curr_edge_dist = torch.norm(pos[src] - pos[dst], dim=-1, keepdim=True)
-             
+            curr_edge_dist  = self.featurize_distances(curr_edge_dist, self.offsets_edge, self.delta_edge)
+
             #eucledian length of edges in X_1 
             prev_edge_dist = torch.norm(prev_pos[src] - prev_pos[dst], dim=-1, keepdim=True)
-            
+            prev_edge_dist = self.featurize_distances(prev_edge_dist, self.offsets_edge, self.delta_edge)
+
             #difference in edge lengths of X_1 and X_t
             edge_dist_diff = prev_edge_dist - curr_edge_dist 
+            #edge_dist_rbf = self.featurize_distances(torch.abs(edge_dist_diff), self.offsets_edge, self.delta_edge)
 
             #MLP(concat(edge_states, edge_dist_diff)) + edge states
             edge_resid_input = torch.cat([edge_states, edge_dist_diff], dim=-1)
-            edge_states = edge_states + self.edge_mlp(edge_resid_input)
+            edge_states = edge_states + self.edge_gate(t[src]) * self.edge_mlp(edge_resid_input)
+        
+        if not self.ablations.get("ablate_v", False):
+            # Use aligned prev_pos for vector orientation
+            v = (pos - prev_pos) / (torch.norm(pos - prev_pos, dim=-1, keepdim=True) + 1e-12) 
+            v = v.unsqueeze(-1).expand(-1, -1, self.node_dim) # v (N x 3) -> (N x 3 x F) 
+            node_states_v = self.v_gate(t).unsqueeze(1) * self.v_mlp(v) # unsqueeze(1) for broadcasting [N, 1, 1] with [N, 3, F]
 
-        return node_states_s, edge_states
+        return node_states_s, node_states_v, edge_states
+
+
+class RepresentationProbe(nn.Module):
+    """
+    Dummy layer used purely as an anchor for PyTorch forward hooks.
+    Takes the tensor and its batch index, returning the tensor unmodified.
+    """
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, x, node_index=None):
+        return x
+
 
 
 #ONLY scaling, no bias

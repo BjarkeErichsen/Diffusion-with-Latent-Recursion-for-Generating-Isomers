@@ -170,9 +170,7 @@ class LitModule(pl.LightningModule):
         model = self.get_model(ema=ema)
         ptr = batch.ptr
 
-        eval_override = batch_idx < getattr(model, "eval_trm", 0) #latent recursion: whether to save the intermediate latent states for trm
-
-        samples = model.sample(batch, n_steps=self.hparams.n_integration_steps, eval_trm_override=eval_override, epoch=self.current_epoch) #latent recursion: added epoch and eval_override
+        samples = model.sample(batch, n_steps=self.hparams.n_integration_steps, epoch=self.current_epoch)
         atoms = self.atoms_from_tensors(**samples, ptr=ptr)
         return atoms
 

@@ -1,7 +1,7 @@
 seed: 42
-project: "g3m"
+project: "g3m_geom"
 tags:
-  - qm9
+  - geomdrugs
 train: true
 
 # logging-specific
@@ -10,11 +10,16 @@ output_dir: ${hydra:runtime.output_dir}
 work_dir: ${hydra:runtime.cwd}
 
 # data-specific
-data_path: ${oc.env:DATA_PATH}/qm9/preprocessed
+# data_path: ${oc.env:DATA_PATH}/qm9/preprocessed
+# infos_path: ${data_path}/train_infos.json
+# data_name: "qm9"
+# atom_types_str: [ "H", "C", "N", "O", "F" ]
+# max_num_atoms: 29
+data_path: ${oc.env:DATA_PATH}/geom_drugs/preprocessed
 infos_path: ${data_path}/train_infos.json
-data_name: "qm9"
-atom_types_str: [ "H", "C", "N", "O", "F" ]
-max_num_atoms: 29
+data_name: "geomdrugs"
+atom_types_str: ["H", "B", "C", "N", "O", "F", "Si", "P", "S", "Cl", "Br", "I", "Bi"]
+max_num_atoms: 40
 
 # model-specific
 zero_cog: true
