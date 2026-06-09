@@ -15,6 +15,7 @@ infos_path: ${data_path}/train_infos.json
 data_name: "qm9"
 atom_types_str: [ "H", "C", "N", "O", "F" ]
 max_num_atoms: 29
+remove_h: false
 
 # model-specific
 zero_cog: true
@@ -35,10 +36,18 @@ M: 8 #latent-recursion: scratchpad number of tokens
 z_dim: 64 #64 #latent-recursion: scratchpad latent dim
 scprop: 0.5 #self-conditioning and latent recursion: 1 means no skipping 0 means all skipping. We SKIP if rand(1) > scprop
 
+# Classifier-Free Guidance (CFG) shape conditioning
+cfg: false
+cfg_prop: 0.5
+cfg_property: "eigenvalues_normalized"
+cfg_scale: 1.0
+condition_dim: 3
+
 ablations:
   ablate_s: false
   ablate_v: false
   ablate_edge: false
+  ablate_unit_vectors: false
 
 # validation
 monitor_metric: "val/molecule_stable"
@@ -47,6 +56,7 @@ val_every_n_epochs: 5
 
 datamodule:
   _target_: src_gmmm.data.datamodule.DataModule
+  remove_h: ${remove_h}
   transform:
     _target_: torch_geometric.transforms.Compose
     transforms:
@@ -65,6 +75,7 @@ datamodule:
 
 lit_module:
   _target_: src_gmmm.lit.module.LitModule
+  cfg_scale: ${cfg_scale}
 
   model:
     _target_: src_gmmm.model.diffusion.EquivariantDiffusion
@@ -75,6 +86,10 @@ lit_module:
     latent_recursion: ${latent_recursion}
     n: ${n}
     K: ${K}
+    
+    cfg: ${cfg}
+    cfg_prop: ${cfg_prop}
+    cfg_property: ${cfg_property}
     
     parameterization:
       _target_: src_gmmm.model.score.EquivariantParameterization
@@ -98,6 +113,7 @@ lit_module:
         M: ${M} #latent-recursion: height of scratchpad
         z_dim: ${z_dim} #latent-recursion: dimensionality of scratchpad
         ablations: ${ablations}
+        condition_dim: ${condition_dim}
 
       readout:
         _target_: src_gmmm.nn.readout.DataPointReadout
@@ -124,6 +140,8 @@ lit_module:
     atom_types_str: ${atom_types_str}
     max_num_atoms: ${max_num_atoms}
     json_path: ${infos_path}
+    remove_h: ${remove_h}
+
 
 
   n_integration_steps: 250

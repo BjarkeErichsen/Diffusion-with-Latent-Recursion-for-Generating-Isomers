@@ -395,8 +395,37 @@ Lines ~185-186 (Return statement of `EquivariantDiffusion.reverse_step_em`):
 ```python
 # [EXISTING CODE]
         return pos_t, h_t
-# [NEW CODE COMPILES AS] -> Change the return statement to:
         return pos_t, h_t, preds #self-conditioning: return predictions
 ```
 
+---
+
+### 5. Unit Vectors Self-Conditioning
+
+In addition to scalar node ($s$), vector node ($v$), and edge ($e$) tracks, we also inject self-conditioning into the **unit vectors** track ($unit\_vectors$ which has shape `(n_edges, 3)`). 
+
+To ensure the model treats all 3 spatial directions uniformly (preserving 3D symmetries) without mixing x, y, and z components with different weights, the feature expansion and reduction occurs along a newly created feature dimension.
+
+**C. Unit Vectors Injection:**
+For every edge, we extract the distance vector from `prev_preds` and the current state. We compute the difference of their normalized unit vectors, stack them along a new feature dimension, and pass this through an MLP that acts purely on the feature dimension (e.g., `nn.Linear(2, 1, bias=False)`). This aggregates the temporal unit vector information while keeping spatial coordinates cleanly unmixed.
+
+*FlowMol-like Unit Vectors snippet:*
+```python
+# C. Unit Vectors Invariance (temporal difference of edge directions)
+vectors_prev = prev_pos[dst] - prev_pos[src]
+vectors_current = pos_t[dst] - pos_t[src]
+
+# Normalize to unit vectors
+vectors_prev = vectors_prev / (torch.norm(vectors_prev, dim=-1, keepdim=True) + 1.0)
+vectors_current = vectors_current / (torch.norm(vectors_current, dim=-1, keepdim=True) + 1.0)
+
+vector_diff = vectors_prev - vectors_current
+unit_vector_resid = torch.cat([unit_vectors.unsqueeze(-1), vector_diff.unsqueeze(-1)], dim=-1)
+
+# Apply shared-weight MLP across the 2-channel feature dimension
+unit_vector_mlp_out = self.unit_vector_mlp(unit_vector_resid).squeeze(-1)
+
+# Apply time-conditioned gating
+unit_vectors = unit_vectors + unit_vector_gate(t) * unit_vector_mlp_out
+```
 

@@ -117,7 +117,8 @@ class EdgeEmbedding(nn.Module):
 
 class EdgeUpdateLayer(nn.Module):
     """
-    Simple update: We just let edges reflect the new distances 
+    If using edge updates:
+        let edges reflect the new distances By updating the edges during each message passing layer
     """
     def __init__(self, hidden_dim: int, edge_dim: int, architecture: str="layernorm"):
         super().__init__()
@@ -161,6 +162,7 @@ class EquivLayerNorm(nn.Module):
         dims: tuple[int, Optional[int]],
         eps: float = 1e-6,
         affine: bool = True,
+        condition_dim: Optional[int] = None, 
     ):
         super().__init__()
 
@@ -168,6 +170,8 @@ class EquivLayerNorm(nn.Module):
         self.sdim, self.vdim = dims
         self.eps = eps
         self.affine = affine
+        self.condition_dim = condition_dim
+
         if affine:
             self.weight_s = nn.Parameter(torch.Tensor(self.sdim))
             self.bias_s = nn.Parameter(torch.Tensor(self.sdim))
@@ -177,6 +181,16 @@ class EquivLayerNorm(nn.Module):
             self.register_parameter("bias_s", None)
             # self.register_parameter("weight_v", None)
 
+        if self.condition_dim is not None:
+            self.cond_proj_s = nn.Linear(condition_dim, 2 * self.sdim)
+            nn.init.zeros_(self.cond_proj_s.weight)
+            nn.init.zeros_(self.cond_proj_s.bias)
+            
+            if self.vdim is not None:
+                self.cond_proj_v = nn.Linear(condition_dim, self.vdim)
+                nn.init.zeros_(self.cond_proj_v.weight)
+                nn.init.zeros_(self.cond_proj_v.bias)
+                
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -186,7 +200,7 @@ class EquivLayerNorm(nn.Module):
             # self.weight_v.data.fill_(1.0)
 
     def forward(
-        self, s: torch.Tensor, v: torch.Tensor, index: torch.Tensor
+        self, s: torch.Tensor, v: torch.Tensor, index: torch.Tensor, c: Optional[torch.Tensor] = None
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
 
         batch_size = int(index.max()) + 1
@@ -202,13 +216,21 @@ class EquivLayerNorm(nn.Module):
 
         if self.affine and self.weight_s is not None and self.bias_s is not None:
             sout = sout * self.weight_s + self.bias_s
+            
+        # Apply S conditioning
+        if self.condition_dim is not None and c is not None:
+            gamma_s, beta_s = torch.chunk(self.cond_proj_s(c), chunks=2, dim=-1)
+            sout = sout * (1 + gamma_s[index]) + beta_s[index]
 
         if v is not None:
             vmean = torch.pow(v, 2).sum(dim=1, keepdim=True).mean(dim=-1, keepdim=True)
             vmean = scatter_mean(vmean, index, dim=0, dim_size=batch_size) #vmean -> (n_graphs, 1, 1)
             vmean = torch.clamp(vmean, min=self.eps) 
             vout = v / torch.sqrt(vmean[index]) #modified from vmean[index]
-
+            
+            # Apply V conditioning
+            if self.condition_dim is not None and c is not None:
+                vout = vout * (1 + self.cond_proj_v(c)[index].unsqueeze(1))
         else:
             vout = None
 
@@ -241,6 +263,9 @@ class SelfConditioningResidualLayer(nn.Module):
         )
         self.v_mlp = nn.Linear(node_dim, node_dim, bias=False) #only used if we want to use v-conditioning
         
+        self.unit_vector_mlp = nn.Linear(2, 1, bias=False)
+        
+        #gates 
         self.s_gate = nn.Sequential(
             nn.Linear(time_dim, 1),
             nn.Sigmoid()
@@ -253,6 +278,17 @@ class SelfConditioningResidualLayer(nn.Module):
             nn.Linear(time_dim, 1),
             nn.Sigmoid()
         )
+        self.unit_vector_gate = nn.Sequential(
+            nn.Linear(time_dim, 1),
+            nn.Sigmoid()
+        )
+
+        self.probes = nn.ModuleDict({
+            "sc_s_gate": RepresentationProbe(),
+            "sc_edge_gate": RepresentationProbe(),
+            "sc_v_gate": RepresentationProbe(),
+            "sc_unit_vector_gate": RepresentationProbe(),
+        })
 
         # RBF buffers
         self.register_buffer("offsets_s", torch.linspace(0, max_distance, self.rbf_s_dim).unsqueeze(0))
@@ -266,7 +302,7 @@ class SelfConditioningResidualLayer(nn.Module):
         return torch.exp(-((distances - offsets)**2) / delta)
 
 
-    def forward(self, node_states_s, node_states_v, edge_states, pos , prev_preds, node_index, edge_node_index, t, use_alignment=True):
+    def forward(self, node_states_s, node_states_v, edge_states, unit_vectors, pos , prev_preds, node_index, edge_node_index, t, use_alignment=True):
         prev_pos = prev_preds["pos"]
         #prev_h = prev_preds["h"] #TODO: add this back when we start using diffusion_h
 
@@ -296,7 +332,9 @@ class SelfConditioningResidualLayer(nn.Module):
             node_dist = torch.norm(pos - prev_pos, dim=-1, keepdim=True) 
             node_dist_rbf = self.featurize_distances(node_dist, self.offsets_s, self.delta_s)
             node_resid_input = torch.cat([node_states_s, node_dist_rbf], dim=-1) #TODO: add prev_h when we start using diffusion_h
-            node_states_s = node_states_s + self.s_gate(t) * self.node_mlp(node_resid_input) #map back to dim of s 
+            gate_val = self.s_gate(t)
+            gate_val = self.probes["sc_s_gate"](gate_val, node_index)
+            node_states_s = node_states_s + gate_val * self.node_mlp(node_resid_input) #map back to dim of s 
 
         if not self.ablations.get("ablate_edge", False):
             #Edges e
@@ -316,15 +354,33 @@ class SelfConditioningResidualLayer(nn.Module):
 
             #MLP(concat(edge_states, edge_dist_diff)) + edge states
             edge_resid_input = torch.cat([edge_states, edge_dist_diff], dim=-1)
-            edge_states = edge_states + self.edge_gate(t[src]) * self.edge_mlp(edge_resid_input)
+            gate_val = self.edge_gate(t[src])
+            gate_val = self.probes["sc_edge_gate"](gate_val, edge_node_index)
+            edge_states = edge_states + gate_val * self.edge_mlp(edge_resid_input)
         
+        if not self.ablations.get("ablate_unit_vectors", False):
+            src, dst = edge_node_index
+            vectors_prev = prev_pos[dst] - prev_pos[src]  # (n_edges, 3) vector (i - > j)
+            vectors_current = pos[dst] - pos[src]  # (n_edges, 3) vector (i - > j)
+            # Normalize like in EdgeEmbedding
+            vectors_prev = vectors_prev / (torch.norm(vectors_prev, dim=-1, keepdim=True) + 1.0)
+            vectors_current = vectors_current / (torch.norm(vectors_current, dim=-1, keepdim=True) + 1.0)
+            vector_diff = vectors_prev - vectors_current 
+            unit_vector_resid = torch.cat([unit_vectors.unsqueeze(-1), vector_diff.unsqueeze(-1)], dim=-1)
+            unit_vector_mlp_out = self.unit_vector_mlp(unit_vector_resid).squeeze(-1)
+            unit_vector_gate_val = self.unit_vector_gate(t[src])
+            unit_vector_gate_val = self.probes["sc_unit_vector_gate"](unit_vector_gate_val, edge_node_index)
+            unit_vectors = unit_vectors + unit_vector_gate_val * unit_vector_mlp_out
+
         if not self.ablations.get("ablate_v", False):
             # Use aligned prev_pos for vector orientation
             v = (pos - prev_pos) / (torch.norm(pos - prev_pos, dim=-1, keepdim=True) + 1e-12) 
             v = v.unsqueeze(-1).expand(-1, -1, self.node_dim) # v (N x 3) -> (N x 3 x F) 
-            node_states_v = self.v_gate(t).unsqueeze(1) * self.v_mlp(v) # unsqueeze(1) for broadcasting [N, 1, 1] with [N, 3, F]
+            gate_val = self.v_gate(t).unsqueeze(1)
+            gate_val = self.probes["sc_v_gate"](gate_val, node_index)
+            node_states_v = gate_val * self.v_mlp(v) # unsqueeze(1) for broadcasting [N, 1, 1] with [N, 3, F]
 
-        return node_states_s, node_states_v, edge_states
+        return node_states_s, node_states_v, edge_states, unit_vectors
 
 
 class RepresentationProbe(nn.Module):
@@ -337,7 +393,6 @@ class RepresentationProbe(nn.Module):
         
     def forward(self, x, node_index=None):
         return x
-
 
 
 #ONLY scaling, no bias

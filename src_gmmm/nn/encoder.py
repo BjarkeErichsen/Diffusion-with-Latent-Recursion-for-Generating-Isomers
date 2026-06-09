@@ -16,6 +16,7 @@ class InteractionLayer(nn.Module):
         self,
         node_dim: int,
         edge_dim: int,
+        condition_dim: Optional[int] = None,
     ):
         super(InteractionLayer, self).__init__()
         self.node_dim = node_dim
@@ -30,7 +31,7 @@ class InteractionLayer(nn.Module):
             nn.Sigmoid(),
         )
 
-        self.ln = EquivLayerNorm(dims=(node_dim, node_dim))
+        self.ln = EquivLayerNorm(dims=(node_dim, node_dim), condition_dim=condition_dim)
 
     def forward(
         self,
@@ -40,11 +41,12 @@ class InteractionLayer(nn.Module):
         unit_vectors: torch.Tensor,
         node_index: torch.Tensor,
         edge_node_index: torch.Tensor,
+        c: Optional[torch.Tensor] = None,
     ):
         src_idx, dst_idx = edge_node_index
 
         node_states_s, node_states_v = self.ln.forward(
-            node_states_s, node_states_v, node_index
+            node_states_s, node_states_v, node_index, c=c
         )
 
         W = self.W(edge_states)
@@ -145,7 +147,8 @@ class EquivEncoder(nn.Module):
         M: int = 8, #latent recursion: rows latent dimension
         z_dim: int = 64, #latent dimension: columns latent dimension
         update_edge_states: bool = False, #update edge states
-        ablations: dict = None #ablations dict
+        ablations: dict = None, #ablations dict
+        condition_dim: Optional[int] = None, # shape condition dimension
     ):
         super(EquivEncoder, self).__init__()
 
@@ -173,7 +176,7 @@ class EquivEncoder(nn.Module):
         # Interaction layers
         self.interactions = nn.ModuleList(
             [
-                InteractionLayer(hidden_dim, edge_embedding.out_features)
+                InteractionLayer(hidden_dim, edge_embedding.out_features, condition_dim=condition_dim)
                 for _ in range(num_layers)
             ]
         )
@@ -240,15 +243,17 @@ class EquivEncoder(nn.Module):
         
         
         self.probes = nn.ModuleDict({
-            "before_sc_s": RepresentationProbe(),
-            "before_sc_e": RepresentationProbe(),
+            "pre_sc_s": RepresentationProbe(),
+            "pre_sc_e": RepresentationProbe(),
+            "pre_sc_unit_vectors": RepresentationProbe(),
             "post_sc_s": RepresentationProbe(),
             "post_sc_v": RepresentationProbe(),
             "post_sc_e": RepresentationProbe(),
-            "layer_0_s": RepresentationProbe(),
-            "layer_0_v": RepresentationProbe(),
+            "post_sc_unit_vectors": RepresentationProbe(),
             "prev_pos": RepresentationProbe(),
             "pos": RepresentationProbe(),
+            **{f"layer_{i}_s": RepresentationProbe() for i in range(num_layers)},
+            **{f"layer_{i}_v": RepresentationProbe() for i in range(num_layers)},
         })
 
 
@@ -261,7 +266,7 @@ class EquivEncoder(nn.Module):
         edge_node_index: Optional[torch.Tensor],
         prev_preds: dict[torch.Tensor, torch.Tensor] = None, #self-conditioning previous predictions
         z_prev: torch.Tensor = None, #latent recursion previous z
-        
+        c: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
 
         t = self.time_embedding(t)
@@ -319,15 +324,17 @@ class EquivEncoder(nn.Module):
                  
         #self-conditioning: update node and edge states with previous predictions. Done BEFORE interaction and update layers.
         if self.self_conditioning and prev_preds is not None:
-            node_states_s = self.probes["before_sc_s"](node_states_s, node_index)
-            edge_states   = self.probes["before_sc_e"](edge_states, edge_node_index)  
+            node_states_s = self.probes["pre_sc_s"](node_states_s, node_index)
+            edge_states   = self.probes["pre_sc_e"](edge_states, edge_node_index)  
+            unit_vectors  = self.probes["pre_sc_unit_vectors"](unit_vectors, edge_node_index)
             prev_preds["pos"] = self.probes["prev_pos"](prev_preds["pos"], node_index)
             pos               = self.probes["pos"](pos, node_index)
             
-            node_states_s, node_states_v, edge_states = self.sc_layer.forward(
+            node_states_s, node_states_v, edge_states, unit_vectors = self.sc_layer.forward(
                 node_states_s = node_states_s,
                 node_states_v = node_states_v,
                 edge_states = edge_states, 
+                unit_vectors = unit_vectors,
                 pos = pos, 
                 prev_preds = prev_preds, 
                 node_index = node_index, 
@@ -338,6 +345,8 @@ class EquivEncoder(nn.Module):
             node_states_s = self.probes["post_sc_s"](node_states_s, node_index)
             node_states_v = self.probes["post_sc_v"](node_states_v, node_index)
             edge_states   = self.probes["post_sc_e"](edge_states, edge_node_index)  
+            unit_vectors  = self.probes["post_sc_unit_vectors"](unit_vectors, edge_node_index)
+
         
         #latent recursion: initialize z_prev and run primer
         #Z_proc = z_prev
@@ -373,6 +382,7 @@ class EquivEncoder(nn.Module):
                 unit_vectors=unit_vectors,
                 node_index=node_index,
                 edge_node_index=edge_node_index,
+                c=c,
             )
             node_states_s, node_states_v = update(node_states_s, node_states_v)
             
@@ -386,10 +396,8 @@ class EquivEncoder(nn.Module):
             #        v = node_states_v,
             #        node_index = node_index
             #    )
-            if i == 0:
-                node_states_s = self.probes["layer_0_s"](node_states_s, node_index)
-                node_states_v = self.probes["layer_0_v"](node_states_v, node_index)
-                
+            node_states_s = self.probes[f"layer_{i}_s"](node_states_s, node_index)
+            node_states_v = self.probes[f"layer_{i}_v"](node_states_v, node_index)
         states = {"s": node_states_s, "v": node_states_v}
         
         #latent recursion: final readout with residual connection

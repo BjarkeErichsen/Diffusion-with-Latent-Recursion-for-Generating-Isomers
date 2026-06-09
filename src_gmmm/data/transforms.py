@@ -73,3 +73,24 @@ class ZeroCoG(BaseTransform):
         setattr(data, self.key, centered_pos)
 
         return data
+
+
+@functional_transform("remove_hydrogens")
+class RemoveHydrogens(BaseTransform):
+    def __init__(self) -> None:
+        pass
+
+    def forward(self, data: Data) -> Data:
+        mask = data.h != 1
+        data.h = data.h[mask]
+        data.pos = data.pos[mask]
+        
+        for key in data.keys():
+            if key in ["h", "pos"]:
+                continue
+            item = getattr(data, key)
+            if torch.is_tensor(item) and item.dim() > 0 and item.size(0) == mask.size(0):
+                setattr(data, key, item[mask])
+                
+        return data
+

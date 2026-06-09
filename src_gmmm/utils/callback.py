@@ -111,7 +111,8 @@ class LogSampledAtomsCallback(Callback):
             idx = min(len(self.atoms_lst), self.num_log_wandb)
             fig = make_atoms_grid(self.atoms_lst[-idx:])
 
-            logger.log_image(f"val/images", [fig])
+            if logger is not None:
+                logger.log_image(f"val/images", [fig])
             plt.close(fig)
 
     def on_test_epoch_end(self, trainer: Trainer, pl_module: LightningModule) -> None:

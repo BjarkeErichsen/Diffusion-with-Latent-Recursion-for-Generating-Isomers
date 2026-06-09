@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from typing import Optional
 
 from ..nn.encoder import EquivEncoder
 from ..nn.readout import Readout
@@ -24,6 +25,7 @@ class EquivariantParameterization(nn.Module):
         edge_node_index: torch.Tensor,
         prev_preds = None, #self-conditioning: previous predictions
         z_prev = None, #latent recursion: previous latent states
+        c: Optional[torch.Tensor] = None,
     ):
         states = self.encoder.forward(
             t=t,
@@ -33,6 +35,7 @@ class EquivariantParameterization(nn.Module):
             edge_node_index=edge_node_index,
             prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
             z_prev=z_prev, #latent recursion: pass previous latent states to the model
+            c=c,
         )
 
         preds = self.readout.forward(

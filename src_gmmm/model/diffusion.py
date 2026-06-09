@@ -19,6 +19,9 @@ class EquivariantDiffusion(nn.Module):
         latent_recursion: bool = False, #latent recursion: whether to use latent recursion
         n: int = 1, #latent recursion: number of latent recursion steps
         K: int = 2, #latent recursion: number of deep recursion steps
+        cfg: bool = False, # classifier-free guidance enabled
+        cfg_prop: float = 0.5, # probability of replacing condition with null
+        cfg_property: str = "eigenvalues_normalized", # property to condition on
     ):
         super().__init__()
 
@@ -32,8 +35,23 @@ class EquivariantDiffusion(nn.Module):
         self.n = n
         self.K = K 
 
+        self.cfg = cfg
+        self.cfg_prop = cfg_prop
+        self.cfg_property = cfg_property
+
     def loss_diffusion(self, t: torch.Tensor, batch: Batch | Data):
         latents, targets = self.training_targets(t=t, batch=batch)
+
+        c = None
+        if self.cfg:
+            c = getattr(batch, self.cfg_property, None)
+            if c is not None:
+                c = c.view(batch.num_graphs, -1)
+                if self.training:
+                    # Standard 50/50% conditional/unconditional training
+                    # Replace with zero vector (unconditional) with probability cfg_prop
+                    mask = (torch.rand(c.size(0), 1, device=c.device) > self.cfg_prop).float()
+                    c = c * mask
         
         #self-conditioning: run an inference step without backprop to get previous predictions
         prev_preds = None 
@@ -44,6 +62,7 @@ class EquivariantDiffusion(nn.Module):
                     **latents,
                     node_index=batch.batch,
                     edge_node_index=batch.edge_node_index,
+                    c=c,
                 )
         
         #latent recursion: arbitrary number of recursion steps
@@ -64,13 +83,14 @@ class EquivariantDiffusion(nn.Module):
                                 edge_node_index=batch.edge_node_index,
                                 prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
                                 z_prev=z_prev, #latent recursion: pass previous latent states to the model
+                                c=c,
                             )
                             z_prev = preds.get("z", None)
                         
                         # Update X1 (prevpreds) and Z, detach
                         preds = self.parameterization.forward(
                             t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
-                            prev_preds=prev_preds, z_prev=z_prev
+                            prev_preds=prev_preds, z_prev=z_prev, c=c
                         )
                         z_prev = preds.get("z", None)
                         if not z_prev is None:
@@ -90,13 +110,13 @@ class EquivariantDiffusion(nn.Module):
                 #    continue
                 preds = self.parameterization.forward(
                     t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
-                    prev_preds=prev_preds, z_prev=z_prev
+                    prev_preds=prev_preds, z_prev=z_prev, c=c
                 )
                 z_prev = preds.get("z", None)
             
             preds = self.parameterization.forward(
                 t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
-                prev_preds=prev_preds, z_prev=z_prev
+                prev_preds=prev_preds, z_prev=z_prev, c=c
             )
 
 
@@ -109,6 +129,7 @@ class EquivariantDiffusion(nn.Module):
                 edge_node_index=batch.edge_node_index,
                 prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
                 z_prev=z_prev, #latent recursion: pass previous latent states to the model
+                c=c,
             )
 
         losses = {}
@@ -185,6 +206,8 @@ class EquivariantDiffusion(nn.Module):
         ts: float = 1.0,
         tf: float = 1e-3,
         epoch: int = -1,
+        cfg_scale: float = 1.0,
+        c: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[
         dict[str, torch.Tensor],
@@ -204,6 +227,13 @@ class EquivariantDiffusion(nn.Module):
                 "h": [h_t],
             }
         
+        if self.cfg:
+            if c is None:
+                c = getattr(batch, self.cfg_property, None)
+            if c is not None:
+                c = c.view(num_graphs, -1)
+            else:
+                c = torch.zeros((num_graphs, 3), device=device)
         
         prev_preds = None  #self-conditioning: previous predictions
         for i in range(n_steps):
@@ -222,6 +252,8 @@ class EquivariantDiffusion(nn.Module):
                     node_index=node_index,
                     edge_node_index=edge_node_index,
                     prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
+                    c=c,
+                    cfg_scale=cfg_scale,
                 )
             if return_traj:
                 traj["pos"].append(pos_t)
@@ -248,6 +280,8 @@ class EquivariantDiffusion(nn.Module):
         node_index: torch.Tensor,
         edge_node_index: torch.Tensor,
         prev_preds: Optional[dict[torch.Tensor, torch.Tensor]] = None, #self-conditioning: previous predictions
+        c: Optional[torch.Tensor] = None,
+        cfg_scale: float = 1.0,
     ):
         
         z_intermediates = []
@@ -263,19 +297,52 @@ class EquivariantDiffusion(nn.Module):
                     edge_node_index=edge_node_index,
                     prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
                     z_prev=z_prev, #latent recursion: pass previous latent states to the model
+                    c=c,
                 )
                 z_prev = preds.get("z", None)
         
         # get NN predictions
-        preds = self.parameterization.forward(
-            t=t,
-            pos=pos_t,
-            h=h_t,
-            node_index=node_index,
-            edge_node_index=edge_node_index,
-            prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
-            z_prev=z_prev, #latent recursion: pass previous latent states to the model
-        )
+        if self.cfg and c is not None:
+            c_null = torch.zeros_like(c)
+            preds_uncond = self.parameterization.forward(
+                t=t,
+                pos=pos_t,
+                h=h_t,
+                node_index=node_index,
+                edge_node_index=edge_node_index,
+                prev_preds=prev_preds,
+                z_prev=z_prev,
+                c=c_null,
+            )
+            preds_cond = self.parameterization.forward(
+                t=t,
+                pos=pos_t,
+                h=h_t,
+                node_index=node_index,
+                edge_node_index=edge_node_index,
+                prev_preds=prev_preds,
+                z_prev=z_prev,
+                c=c,
+            )
+            preds = {}
+            for key in preds_cond:
+                if key == "z":
+                    preds[key] = preds_cond[key]
+                elif isinstance(preds_cond[key], torch.Tensor):
+                    preds[key] = preds_uncond[key] + cfg_scale * (preds_cond[key] - preds_uncond[key])
+                else:
+                    preds[key] = preds_cond[key]
+        else:
+            preds = self.parameterization.forward(
+                t=t,
+                pos=pos_t,
+                h=h_t,
+                node_index=node_index,
+                edge_node_index=edge_node_index,
+                prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
+                z_prev=z_prev, #latent recursion: pass previous latent states to the model
+                c=c,
+            )
 
         # reverse step on each modality
         if self.diffusion_pos:

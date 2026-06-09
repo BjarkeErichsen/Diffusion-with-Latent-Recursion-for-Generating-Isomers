@@ -15,12 +15,21 @@ _SYMBOLS_QM9 = ["H", "C", "N", "O", "F"]
 class QM9Metrics(Metrics):
     def __init__(
         self,
-        atom_types_str: str = _SYMBOLS_QM9,
+        atom_types_str: list[str] = _SYMBOLS_QM9,
         max_num_atoms: int = 29,
         json_path: Optional[str | Path] = None,
         summarize_hidden: bool = False,
         hidden_prefix: str = "_",
+        remove_h: bool = False,
     ):
+        if remove_h:
+            if "H" in atom_types_str:
+                h_idx = atom_types_str.index("H")
+                atom_types_str = [s for s in atom_types_str if s != "H"]
+            else:
+                h_idx = None
+        else:
+            h_idx = None
 
         self.encoder = {s: idx for idx, s in enumerate(atom_types_str)}
         self.max_num_atoms = max_num_atoms
@@ -29,6 +38,10 @@ class QM9Metrics(Metrics):
             dataset_infos = read_json(json_path=json_path)
             ref_smiles = set(dataset_infos.get("smiles"))
             ref_atom_hist = np.array(dataset_infos.get("atom_hist"))
+            if remove_h and h_idx is not None and ref_atom_hist is not None:
+                ref_atom_hist = np.delete(ref_atom_hist, h_idx)
+                if ref_atom_hist.sum() > 0:
+                    ref_atom_hist = ref_atom_hist / ref_atom_hist.sum()
         else:
             ref_smiles = set([])
             ref_atom_hist = None

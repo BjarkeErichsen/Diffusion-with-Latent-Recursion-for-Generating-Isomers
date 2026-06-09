@@ -48,6 +48,7 @@ class LitModule(pl.LightningModule):
         loss_during_val: bool = True,
         loss_weights: Optional[dict] = None,
         metrics: Optional[Metrics] = None,
+        cfg_scale: float = 1.0,
     ):
         super().__init__()
         self.model = model
@@ -170,7 +171,12 @@ class LitModule(pl.LightningModule):
         model = self.get_model(ema=ema)
         ptr = batch.ptr
 
-        samples = model.sample(batch, n_steps=self.hparams.n_integration_steps, epoch=self.current_epoch)
+        samples = model.sample(
+            batch,
+            n_steps=self.hparams.n_integration_steps,
+            epoch=self.current_epoch,
+            cfg_scale=self.hparams.cfg_scale,
+        )
         atoms = self.atoms_from_tensors(**samples, ptr=ptr)
         return atoms
 

@@ -25,8 +25,18 @@ class DataModule(LightningDataModule):
         num_workers: int = 0,
         pin_memory: bool = False,
         subset_seed: int = 42,
+        remove_h: bool = False,
     ):
         super().__init__()
+
+        if remove_h:
+            from ..data.transforms import RemoveHydrogens
+            if transform is None:
+                transform = RemoveHydrogens()
+            elif isinstance(transform, T.Compose):
+                transform.transforms.insert(0, RemoveHydrogens())
+            else:
+                transform = T.Compose([RemoveHydrogens(), transform])
 
         self.train_dataset = Dataset(path=train_path, transform=transform)
 
