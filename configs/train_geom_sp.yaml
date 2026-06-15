@@ -48,6 +48,10 @@ cfg_property: "eigenvalues_normalized_no_h" #use eigenvalues_normalized_no_h whe
 cfg_scale: 1.0
 condition_dim: 3 #we work in 3d
 
+# distogram specific
+# Set use_distogram to null or None to completely disable distogram prediction
+use_distogram: "distogram_no_h"
+distogram_loss_coefficient: 0.1
 ablations:
   ablate_s: false
   ablate_v: false
@@ -81,6 +85,7 @@ datamodule:
 lit_module:
   _target_: src_gmmm.lit.module.LitModule
   cfg_scale: ${cfg_scale}
+  distogram_loss_coefficient: ${distogram_loss_coefficient}
 
   model:
     _target_: src_gmmm.model.diffusion.EquivariantDiffusion
@@ -95,6 +100,7 @@ lit_module:
     cfg: ${cfg}
     cfg_prop: ${cfg_prop}
     cfg_property: ${cfg_property}
+    distogram_property: ${use_distogram}
     
     parameterization:
       _target_: src_gmmm.model.score.EquivariantParameterization
@@ -125,6 +131,7 @@ lit_module:
         hidden_dim: ${hidden_dim}
         pred_h: false
         pred_pos: true
+        pred_distogram: ${use_distogram}
         zero_cog: ${zero_cog}
         parameterization: "residual-time"
 

@@ -54,10 +54,12 @@ class LogSampledAtomsCallback(Callback):
         self.prefix_with_epoch = prefix_with_epoch
 
         self.atoms_lst: list[ase.Atoms] = ...
+        self.atoms_gt_lst: list[ase.Atoms] = ...
 
     def on_validation_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
         super().on_validation_start(trainer, pl_module)
         self.atoms_lst = []
+        self.atoms_gt_lst = []
 
     def on_test_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
         return self.on_validation_start(trainer, pl_module)
@@ -72,6 +74,9 @@ class LogSampledAtomsCallback(Callback):
         dataloader_idx: int = 0,
     ) -> None:
         self.atoms_lst.extend(outputs)
+        
+        atoms_gt = pl_module.atoms_from_tensors(batch.h, batch.pos, batch.ptr)
+        self.atoms_gt_lst.extend(atoms_gt)
 
     def on_test_batch_end(
         self,
@@ -104,16 +109,24 @@ class LogSampledAtomsCallback(Callback):
         if self.save_atoms:
             save_path = os.path.join(dirpath, "samples.xyz")
             save_images(self.atoms_lst, filename=save_path)
+            
+            save_path_gt = os.path.join(dirpath, "samples_gt.xyz")
+            save_images(self.atoms_gt_lst, filename=save_path_gt)
 
         if self.num_log_wandb:
             logger: WandbLogger = get_wandb_logger(trainer)
 
             idx = min(len(self.atoms_lst), self.num_log_wandb)
             fig = make_atoms_grid(self.atoms_lst[-idx:])
+            
+            idx_gt = min(len(self.atoms_gt_lst), self.num_log_wandb)
+            fig_gt = make_atoms_grid(self.atoms_gt_lst[-idx_gt:])
 
             if logger is not None:
                 logger.log_image(f"val/images", [fig])
+                logger.log_image(f"val/images_gt", [fig_gt])
             plt.close(fig)
+            plt.close(fig_gt)
 
     def on_test_epoch_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
         return self.on_validation_epoch_end(trainer, pl_module)

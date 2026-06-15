@@ -97,7 +97,12 @@ def process_file(file_path: str | Path, overwrite: bool = True):
         
     print(f"Saving to {save_path}...")
     start_time = time.time()
-    torch.save(data_list, save_path)
+    
+    # Safe save: write to a temporary file first, then rename
+    temp_save_path = save_path.with_suffix('.pt.tmp')
+    torch.save(data_list, temp_save_path)
+    os.replace(temp_save_path, save_path)
+    
     print(f"Saved in {time.time() - start_time:.2f}s")
     print(f"Successfully processed {file_path}!\n")
 

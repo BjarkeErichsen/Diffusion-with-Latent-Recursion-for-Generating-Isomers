@@ -398,7 +398,7 @@ class EquivEncoder(nn.Module):
             #    )
             node_states_s = self.probes[f"layer_{i}_s"](node_states_s, node_index)
             node_states_v = self.probes[f"layer_{i}_v"](node_states_v, node_index)
-        states = {"s": node_states_s, "v": node_states_v}
+        states = {"s": node_states_s, "v": node_states_v, "edge": edge_states}
         
         #latent recursion: final readout with residual connection
         if self.latent_recursion:

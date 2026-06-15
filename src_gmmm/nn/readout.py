@@ -7,6 +7,8 @@ import torch.nn as nn
 from ..utils.ops import scatter_center
 
 
+from torch_scatter import scatter_mean
+
 class Readout(nn.Module, abc.ABC):
 
     def forward(
@@ -28,6 +30,7 @@ class DataPointReadout(Readout):
         h_output_dim: Optional[int] = 0,
         pred_h: bool = True,
         pred_pos: bool = True,
+        pred_distogram: Optional[str] = None,
         zero_cog: bool = True,
         parameterization: Literal["residual-pos"] = "residual-pos",
     ) -> None:
@@ -44,9 +47,13 @@ class DataPointReadout(Readout):
         if pred_pos:
             self.net_pos = nn.Linear(in_features=hidden_dim, out_features=1, bias=False)
             self.zero_cog = zero_cog
+            
+        if pred_distogram:
+            self.net_dist = nn.Linear(hidden_dim, 128)
 
         self.pred_h = pred_h
         self.pred_pos = pred_pos
+        self.pred_distogram = pred_distogram
         self.parameterization = parameterization
 
     def forward(
@@ -76,5 +83,9 @@ class DataPointReadout(Readout):
                 out_pos = scatter_center(out_pos, index=node_index)
 
             out["pos"] = out_pos
+            
+        if self.pred_distogram:
+            # We predict the distogram for each edge directly
+            out["dist"] = self.net_dist(states["edge"])
 
         return out

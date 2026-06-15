@@ -112,14 +112,13 @@ class GeomDrugsMetrics(Metrics):
                         raise ValueError("Failed to determine bonds with any charge")
 
                     # 3. Let it create hydrogens itself
-                    mol_with_hs = Chem.AddHs(mol, addCoords=True)
+                    mol_with_hs = Chem.AddHs(mol, addCoords=True, explicitOnly=True)
 
                     # 4. Use the exact function from isayevlab to determine stability & validity
                     # is_valid already sanitizes and checks for single fragment
                     val, stab, stab_atoms, atom_counts = compute_molecules_stability(
                         [mol_with_hs], aromatic=True, allowed_bonds=geom_drugs_h_tuple_valencies
                     )
-
                     v = int(val[0].item())
                     c = v  # Their is_valid function enforces len(GetMolFrags) == 1
                     molecule_stable = int(stab[0].item())
