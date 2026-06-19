@@ -46,7 +46,7 @@ Implementation details:
    - *Added* a dedicated, isolated `DistogramLoss` `nn.Module` class to handle the scaling constraints cleanly.
    - **`DistogramLoss` Mechanics**:
      - Pulls `u, v` from `batch.edge_node_index` and computes the exact true distances `dists = torch.norm(pos[u] - pos[v], dim=-1)` for all provided edges.
-     - Assuming the graph is constructed strictly as an upper-triangle (without symmetric duplicates or self-loops), the loss naturally computes the correct average. If this assumption is violated (`u >= v` is found), it prints a warning instead of forcibly filtering.
+     - The graph is all-vs-all connected (excluding self-loops), meaning both $u \to v$ and $v \to u$ edges are present. The loss is computed symmetrically over all directed edges. This naturally trains the edge representations to be symmetric without needing manual masking or filtering.
      - Bucketizes the distances into 128 discrete bins. Distances > 3.2Å are clamped into the final category (`target_bins = torch.clamp(..., max=127)`).
      - Computes `torch.nn.functional.cross_entropy` over the edges and averages the loss (`reduction="mean"`), scaling efficiently without dense memory instantiation.
    - In `EquivariantDiffusion.loss_diffusion`, the `DistogramLoss` is evaluated on-the-fly passing the true positions (`batch.pos`), the fully connected graph edges (`batch.edge_node_index`), and the edge predictions (`preds["dist"]`).
@@ -63,11 +63,10 @@ Updated version: (previous version was incorrect)
     4. Problem:  This will cost too much computation, due to the number of edges being too large.... (we ignore this problem for now...)
     5. Consider every distance greater than the cutoff as its own category. 
     6. We still use a single layer (no hidden layer) predictive head for the edge (same for each edge of course. )
-        - Edges are not symmetric, ie. we only write a->b not b->a, this is fine but it means we only get an upper triangle (with no diagonal) part of the matrix.
+        - The graph is all-vs-all connected, meaning we have edges both ways (a->b and b->a).
     7. Store all the distances computed and real in a matrix. its of shape (num_atoms, num_atoms, num_bins)
         Compute a combined loss for all.
-        Average the loss across num_atoms * num_atoms / 2 - num_atoms
-        (remember it ends up being an upper triangle matrix without a diagonal)
+        Average the loss across all directed edges.
     
     8. Isolate code when possible in functions and classes to do this (especially classes)
     9. Continue the previus implementation description that describes where and what you change, delete the previous lines, when you override/delete previous parts of the implementaiton of distogram loss. 

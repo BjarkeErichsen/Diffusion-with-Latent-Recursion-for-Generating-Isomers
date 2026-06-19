@@ -22,9 +22,6 @@ class DistogramLoss(nn.Module):
         
         u, v = edge_node_index
         
-        if torch.any(u >= v):
-            warnings.warn("edge_node_index contains symmetric duplicates or self loops (u >= v). Distogram loss assumption of upper-triangle only edges does not hold!")
-        
         # 1. Compute exact distances for these edges
         dists = torch.norm(pos[u] - pos[v], dim=-1)
         
@@ -53,7 +50,9 @@ class EquivariantDiffusion(nn.Module):
         cfg: bool = False, # classifier-free guidance enabled
         cfg_prop: float = 0.5, # probability of replacing condition with null
         cfg_property: str = "eigenvalues_normalized", # property to condition on
-        distogram_property: Optional[str] = None, # Property to use for distogram
+        use_distogram: bool = False, # Whether to predict and compute distogram loss
+        distogram_bins: int = 65,
+        distogram_cutoff: float = 5.12,
     ):
         super().__init__()
 
@@ -70,8 +69,8 @@ class EquivariantDiffusion(nn.Module):
         self.cfg = cfg
         self.cfg_prop = cfg_prop
         self.cfg_property = cfg_property
-        self.distogram_property = distogram_property
-        self.distogram_loss_fn = DistogramLoss()
+        self.use_distogram = use_distogram
+        self.distogram_loss_fn = DistogramLoss(num_bins=distogram_bins, cutoff=distogram_cutoff)
 
     def loss_diffusion(self, t: torch.Tensor, batch: Batch | Data):
         latents, targets = self.training_targets(t=t, batch=batch)

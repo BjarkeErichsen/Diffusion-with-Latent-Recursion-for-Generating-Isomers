@@ -28,7 +28,7 @@ num_layers: 8
 hidden_dim: 256
 num_fourier_features: 16
 num_rbf_features: 64
-max_distance: 24.0 # QM9-specific
+max_distance: 24.0 # doubled from QM9
 parameterization: "x0"
 
 # TRM / self-cond specific
@@ -49,9 +49,11 @@ cfg_scale: 1.0
 condition_dim: 3 #we work in 3d
 
 # distogram specific
-# Set use_distogram to null or None to completely disable distogram prediction
-use_distogram: "distogram_no_h"
+# Set use_distogram to false to completely disable distogram prediction
+use_distogram: true
 distogram_loss_coefficient: 0.1
+distogram_bins: 65
+distogram_cutoff: 5.12 #roughly the interraction horizon, similar philosophy to alphafold
 ablations:
   ablate_s: false
   ablate_v: false
@@ -100,7 +102,9 @@ lit_module:
     cfg: ${cfg}
     cfg_prop: ${cfg_prop}
     cfg_property: ${cfg_property}
-    distogram_property: ${use_distogram}
+    use_distogram: ${use_distogram}
+    distogram_bins: ${distogram_bins}
+    distogram_cutoff: ${distogram_cutoff}
     
     parameterization:
       _target_: src_gmmm.model.score.EquivariantParameterization
@@ -129,9 +133,11 @@ lit_module:
       readout:
         _target_: src_gmmm.nn.readout.DataPointReadout
         hidden_dim: ${hidden_dim}
+        num_rbf_features: ${num_rbf_features}
         pred_h: false
         pred_pos: true
         pred_distogram: ${use_distogram}
+        distogram_bins: ${distogram_bins}
         zero_cog: ${zero_cog}
         parameterization: "residual-time"
 

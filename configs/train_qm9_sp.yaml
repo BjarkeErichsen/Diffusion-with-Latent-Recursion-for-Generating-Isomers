@@ -43,6 +43,13 @@ cfg_property: "eigenvalues_normalized"
 cfg_scale: 1.0
 condition_dim: 3
 
+# distogram specific
+# Set use_distogram to false to completely disable distogram prediction
+use_distogram: true
+distogram_loss_coefficient: 0.1
+distogram_bins: 65
+distogram_cutoff: 5.12 #roughly the interraction horizon, similar philosophy to alphafold
+
 ablations:
   ablate_s: false
   ablate_v: false
@@ -76,6 +83,7 @@ datamodule:
 lit_module:
   _target_: src_gmmm.lit.module.LitModule
   cfg_scale: ${cfg_scale}
+  distogram_loss_coefficient: ${distogram_loss_coefficient}
 
   model:
     _target_: src_gmmm.model.diffusion.EquivariantDiffusion
@@ -90,6 +98,9 @@ lit_module:
     cfg: ${cfg}
     cfg_prop: ${cfg_prop}
     cfg_property: ${cfg_property}
+    use_distogram: ${use_distogram}
+    distogram_bins: ${distogram_bins}
+    distogram_cutoff: ${distogram_cutoff}
     
     parameterization:
       _target_: src_gmmm.model.score.EquivariantParameterization
@@ -118,8 +129,11 @@ lit_module:
       readout:
         _target_: src_gmmm.nn.readout.DataPointReadout
         hidden_dim: ${hidden_dim}
+        num_rbf_features: ${num_rbf_features}
         pred_h: false
         pred_pos: true
+        pred_distogram: ${use_distogram}
+        distogram_bins: ${distogram_bins}
         zero_cog: ${zero_cog}
         parameterization: "residual-time"
 

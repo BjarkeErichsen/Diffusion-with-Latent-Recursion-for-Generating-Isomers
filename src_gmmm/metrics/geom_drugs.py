@@ -33,6 +33,7 @@ class GeomDrugsMetrics(Metrics):
         else:
             h_idx = None
 
+        self.remove_h = remove_h
         self.encoder = {s: idx for idx, s in enumerate(atom_types_str)}
         self.max_num_atoms = max_num_atoms
 
@@ -71,10 +72,14 @@ class GeomDrugsMetrics(Metrics):
             atoms = [atoms]
 
         for a in atoms:
-            # 0. Don't model hydrogens at all
-            heavy_indices = [i for i, sym in enumerate(a.symbols) if sym != 'H']
-            heavy_symbols = [a.symbols[i] for i in heavy_indices]
-            heavy_positions = a.positions[heavy_indices]
+            if self.remove_h:
+                atom_indices = [i for i, sym in enumerate(a.symbols) if sym != 'H']
+            else:
+                atom_indices = list(range(len(a.symbols)))
+                
+            atom_symbols = [a.symbols[i] for i in atom_indices]
+            atom_positions = a.positions[atom_indices]
+            n_heavy = len([sym for sym in atom_symbols if sym != 'H'])
 
             v = 0
             c = 0
@@ -82,15 +87,15 @@ class GeomDrugsMetrics(Metrics):
             atom_stable = 0
             total_atoms = 0
             smi = None
-            n_heavy = len(heavy_symbols)
+            n_atoms_current = len(atom_symbols)
 
-            if n_heavy > 0:
+            if n_atoms_current > 0:
                 # 1. create object with atomic positions
                 mol = Chem.RWMol()
-                for symbol in heavy_symbols:
+                for symbol in atom_symbols:
                     mol.AddAtom(Chem.Atom(symbol))
-                conf = Chem.Conformer(n_heavy)
-                for idx, pos in enumerate(heavy_positions):
+                conf = Chem.Conformer(n_atoms_current)
+                for idx, pos in enumerate(atom_positions):
                     conf.SetAtomPosition(idx, Point3D(float(pos[0]), float(pos[1]), float(pos[2])))
                 mol.AddConformer(conf)
 
@@ -111,13 +116,16 @@ class GeomDrugsMetrics(Metrics):
                     if not rd_success:
                         raise ValueError("Failed to determine bonds with any charge")
 
-                    # 3. Let it create hydrogens itself
-                    mol_with_hs = Chem.AddHs(mol, addCoords=True, explicitOnly=True)
+                    if self.remove_h:
+                        # 3. Let it create hydrogens itself
+                        mol_eval = Chem.AddHs(mol, addCoords=True, explicitOnly=True)
+                    else:
+                        mol_eval = mol
 
                     # 4. Use the exact function from isayevlab to determine stability & validity
                     # is_valid already sanitizes and checks for single fragment
                     val, stab, stab_atoms, atom_counts = compute_molecules_stability(
-                        [mol_with_hs], aromatic=True, allowed_bonds=geom_drugs_h_tuple_valencies
+                        [mol_eval], aromatic=True, allowed_bonds=geom_drugs_h_tuple_valencies
                     )
                     v = int(val[0].item())
                     c = v  # Their is_valid function enforces len(GetMolFrags) == 1
@@ -126,7 +134,7 @@ class GeomDrugsMetrics(Metrics):
                     total_atoms = int(atom_counts[0].item())
 
                     if v == 1:
-                        smi = Chem.MolToSmiles(mol_with_hs, canonical=True)
+                        smi = Chem.MolToSmiles(mol_eval, canonical=True)
                         
                 except Exception:
                     v = 0
@@ -143,7 +151,7 @@ class GeomDrugsMetrics(Metrics):
             self.molecule_stable.append(molecule_stable)
             self.atom_stable.append(atom_stable)
             self.total_atoms_with_hs.append(total_atoms)
-            self.atom_hist.append(discrete_histogram(heavy_symbols, encoder=self.encoder))
+            self.atom_hist.append(discrete_histogram(atom_symbols, encoder=self.encoder))
 
     def summarize(self) -> dict:
         assert len(self.valid) == len(self.valid_connected)

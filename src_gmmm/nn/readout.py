@@ -30,9 +30,11 @@ class DataPointReadout(Readout):
         h_output_dim: Optional[int] = 0,
         pred_h: bool = True,
         pred_pos: bool = True,
-        pred_distogram: Optional[str] = None,
+        pred_distogram: bool = False,
         zero_cog: bool = True,
         parameterization: Literal["residual-pos"] = "residual-pos",
+        num_rbf_features: Optional[int] = None,
+        distogram_bins: int = 65,
     ) -> None:
         super(DataPointReadout, self).__init__()
 
@@ -49,7 +51,12 @@ class DataPointReadout(Readout):
             self.zero_cog = zero_cog
             
         if pred_distogram:
-            self.net_dist = nn.Linear(hidden_dim, 128)
+            # The edge embeddings from EquivEncoder have dimension num_rbf_features + 1
+            if num_rbf_features is not None:
+                edge_dim = num_rbf_features + 1
+            else:
+                edge_dim = (hidden_dim // 2) + 1
+            self.net_dist = nn.Linear(edge_dim, distogram_bins)
 
         self.pred_h = pred_h
         self.pred_pos = pred_pos

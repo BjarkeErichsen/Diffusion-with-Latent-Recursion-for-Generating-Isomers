@@ -12,7 +12,7 @@ from src_gmmm.data.dataset import Dataset
 from src_gmmm.metrics.geom_drugs import GeomDrugsMetrics
 from src_gmmm.data.utils import atoms_from_tensors
 
-def main():
+def main(remove_h: bool = True):
     base_path = Path("data/geom_drugs/preprocessed")
     
     print("Loading GEOM datasets...")
@@ -43,10 +43,9 @@ def main():
             subset_data.append(test_data[idx - len_train - len_val])
             
     # Initialize the metric precisely as used during training.
-    # We set remove_h=True which matches the instruction:
-    # "during preprocessing REMOVE hydrogens BEFORE re-adding them"
+    # We set remove_h based on the explicit argument:
     metrics = GeomDrugsMetrics(
-        remove_h=True,
+        remove_h=remove_h,
         json_path=base_path / "train_infos.json"
     )
     
@@ -58,14 +57,15 @@ def main():
         h_atomic_numbers = data.h
         pos = data.pos
         
-        # 1. Remove hydrogens explicitly like the preprocessing step does
-        mask = h_atomic_numbers != 1
-        h_atomic_numbers = h_atomic_numbers[mask]
-        pos = pos[mask]
-        
-        # If the molecule is empty after removing H, skip
-        if h_atomic_numbers.shape[0] == 0:
-            continue
+        # 1. Remove hydrogens explicitly if the setting is True
+        if remove_h:
+            mask = h_atomic_numbers != 1
+            h_atomic_numbers = h_atomic_numbers[mask]
+            pos = pos[mask]
+            
+            # If the molecule is empty after removing H, skip
+            if h_atomic_numbers.shape[0] == 0:
+                continue
             
         # 2. Map atomic numbers to decoder indices
         atomic_numbers = [1, 5, 6, 7, 8, 9, 14, 15, 16, 17, 35, 53, 83]
@@ -102,4 +102,5 @@ def main():
             print(f"{k}: {v}")
 
 if __name__ == "__main__":
-    main()
+    # You can toggle this to True to explicitly remove hydrogens before computing metrics
+    main(remove_h=False)
