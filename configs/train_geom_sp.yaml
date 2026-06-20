@@ -44,9 +44,9 @@ scprop: 0.5 #self-conditioning and latent recursion: 1 means no skipping 0 means
 # Classifier-Free Guidance (CFG) shape conditioning
 cfg: false
 cfg_prop: 0.5
-cfg_property: "eigenvalues_normalized_no_h" #use eigenvalues_normalized_no_h when hydrogen is not used
+cfg_property: "eigenvalues_and_scale"
 cfg_scale: 1.0
-condition_dim: 3 #we work in 3d
+condition_dim: 4
 
 # distogram specific
 # Set use_distogram to false to completely disable distogram prediction

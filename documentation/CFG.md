@@ -6,10 +6,7 @@ Compute the associated eigenvaleu for each molecule in the dataset.
 
 Append this feature to the dataset.
 
-Todo:
-    1 Make a script inside scripts, that does this!
-    2 add a demonstration in an inpynb that shows computing the eigenvalues for a subset of molecules, visualizing the computed values with the molecules.
-    3 Remember, this needs to be relatively fast as we have many datapoitns
+
 
 ## Which attribute to use
 Shape conditioning: 
@@ -59,11 +56,7 @@ We dont do cross attention!
 We implement it in a normalization parameter inside EquivLayerNorm 
     Its already implemented there.
 
-To do:
-    1 Make sure the conditional EquivLayerNorm works
-        1. Ive only changed the part inside the self.condition_dim is not none parts
-        2. The v part should keep equivariance property!
-    2 Interate it into the rest of the code such that when a conditional property as part of the input, we use it!
+
 
 Why?
     For relatively low amounts of information like shape or other scalar values, this is more appropriate.
@@ -77,13 +70,8 @@ Note:
     Please add to configs/train_geom_sp.yaml the following:
         cfg: true/false
         cfg_prop: 0.5
-        cfg_property: "eigenvalues" or "eigenvalues_normalized"
+        cfg_property: "eigenvalues_and_scale"
+        condition_dim: 4
 
 
 
-
-## Evals
-Please as best you can isolate evals to do with CFG in its own seperate file. 
-
-### 1
-How well does the conditional property during validation 
