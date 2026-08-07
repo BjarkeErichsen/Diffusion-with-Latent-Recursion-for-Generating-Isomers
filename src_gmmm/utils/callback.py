@@ -12,6 +12,26 @@ from pytorch_lightning.loggers.wandb import WandbLogger
 
 from ..data.utils import save_images
 
+def get_pairwise_distances(atoms_lst: list[ase.Atoms], sym1: str, sym2: str):
+    dists = []
+    for atoms in atoms_lst:
+        symbols = np.array(atoms.get_chemical_symbols())
+        idx1 = np.where(symbols == sym1)[0]
+        idx2 = np.where(symbols == sym2)[0]
+        if len(idx1) == 0 or len(idx2) == 0:
+            continue
+        dist_mat = atoms.get_all_distances()
+        if sym1 == sym2:
+            # upper triangle
+            for i in range(len(idx1)):
+                for j in range(i + 1, len(idx1)):
+                    dists.append(dist_mat[idx1[i], idx1[j]])
+        else:
+            for i in idx1:
+                for j in idx2:
+                    dists.append(dist_mat[i, j])
+    return np.array(dists)
+
 
 def get_wandb_logger(trainer: Trainer) -> Optional[WandbLogger]:
     wandb_logger = None
@@ -47,11 +67,13 @@ class LogSampledAtomsCallback(Callback):
         save_atoms: bool = True,
         num_log_wandb: int = 25,
         prefix_with_epoch: bool = True,
+        atom_type_pairwise_distogram_plots: bool = True,
     ):
         self.dirpath = dirpath
         self.save_atoms = save_atoms
         self.num_log_wandb = num_log_wandb
         self.prefix_with_epoch = prefix_with_epoch
+        self.atom_type_pairwise_distogram_plots = atom_type_pairwise_distogram_plots
 
         self.atoms_lst: list[ase.Atoms] = ...
         self.atoms_gt_lst: list[ase.Atoms] = ...
@@ -125,6 +147,31 @@ class LogSampledAtomsCallback(Callback):
             if logger is not None:
                 logger.log_image(f"val/images", [fig])
                 logger.log_image(f"val/images_gt", [fig_gt])
+                
+                if self.atom_type_pairwise_distogram_plots:
+                    dist_fig, axs = plt.subplots(2, 2, figsize=(12, 10))
+                    pairs = [("C", "C"), ("C", "H"), ("O", "H"), ("C", "N")]
+                    
+                    # 128 bins between 0 and 2.0
+                    bins = np.linspace(0, 2.0, 128)
+                    
+                    for ax, (sym1, sym2) in zip(axs.flatten(), pairs):
+                        dists_gt = get_pairwise_distances(self.atoms_gt_lst, sym1, sym2)
+                        dists_pred = get_pairwise_distances(self.atoms_lst, sym1, sym2)
+                        
+                        ax.hist(dists_gt, bins=bins, alpha=0.5, label='True')
+                        ax.hist(dists_pred, bins=bins, alpha=0.5, label='Predicted')
+                        ax.set_title(f"{sym1}-{sym2} Distances")
+                        ax.set_yscale('log')
+                        ax.set_xlim(0, 2.0)
+                        ax.set_xlabel("Distance (Å)")
+                        ax.set_ylabel("Count (log)")
+                        ax.legend()
+                    
+                    dist_fig.tight_layout()
+                    logger.log_image(f"val/pairwise_distograms", [dist_fig])
+                    plt.close(dist_fig)
+
             plt.close(fig)
             plt.close(fig_gt)
 

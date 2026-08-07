@@ -4,7 +4,7 @@ from typing import Optional
 import numpy as np
 import torch_geometric.transforms as T
 from pytorch_lightning import LightningDataModule
-from torch.utils.data import Subset
+from torch.utils.data import Subset, RandomSampler
 from torch_geometric.loader import DataLoader
 
 from ..data.dataset import Dataset
@@ -26,6 +26,7 @@ class DataModule(LightningDataModule):
         pin_memory: bool = False,
         subset_seed: int = 42,
         remove_h: bool = False,
+        redraw_val_subset: bool = True,
     ):
         super().__init__()
 
@@ -41,7 +42,10 @@ class DataModule(LightningDataModule):
         self.train_dataset = Dataset(path=train_path, transform=transform)
 
         val_dataset = Dataset(path=val_path, transform=transform)
-        if isinstance(num_val_subset, int) and num_val_subset < len(val_dataset):
+        self.full_val_dataset = val_dataset
+        self.redraw_val_subset = redraw_val_subset
+
+        if not self.redraw_val_subset and isinstance(num_val_subset, int) and num_val_subset < len(val_dataset):
             val_dataset = self.get_random_subset(
                 val_dataset, num_val_subset, seed=subset_seed
             )
@@ -73,6 +77,20 @@ class DataModule(LightningDataModule):
         )
 
     def val_dataloader(self):
+        if self.redraw_val_subset and isinstance(self.hparams.num_val_subset, int) and self.hparams.num_val_subset < len(self.full_val_dataset):
+            sampler = RandomSampler(
+                self.full_val_dataset, 
+                replacement=False, 
+                num_samples=self.hparams.num_val_subset
+            )
+            return DataLoader(
+                dataset=self.full_val_dataset,
+                batch_size=self.hparams.val_batch_size,
+                sampler=sampler,
+                num_workers=self.hparams.num_workers,
+                pin_memory=self.hparams.pin_memory,
+            )
+
         return DataLoader(
             dataset=self.val_dataset,
             batch_size=self.hparams.val_batch_size,
@@ -91,7 +109,7 @@ class DataModule(LightningDataModule):
     @staticmethod
     def get_random_subset(dataset, subset_size, seed):
         rnd = np.random.RandomState(seed=seed)
-        indices = rnd.permutation(np.arange(subset_size))
+        indices = rnd.permutation(np.arange(len(dataset)))[:subset_size]
         subset = Subset(dataset, indices=indices)
 
         return subset

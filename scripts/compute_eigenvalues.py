@@ -16,7 +16,7 @@ def compute_eigenvalues_batched(data_list: List[Data]) -> torch.Tensor:
         # Center positions: X_c = X - mean(X)
         pos_centered = pos - pos.mean(dim=0, keepdim=True)
         # Covariance matrix (unnormalized): X_c^T * X_c
-        cov = torch.matmul(pos_centered.T, pos_centered)
+        cov = torch.matmul(pos_centered.T, pos_centered) / pos_centered.shape[0]
         covs.append(cov)
             
     covs = torch.stack(covs)  # Shape: (B, 3, 3)

@@ -37,18 +37,25 @@ z_dim: 64 #64 #latent-recursion: scratchpad latent dim
 scprop: 0.5 #self-conditioning and latent recursion: 1 means no skipping 0 means all skipping. We SKIP if rand(1) > scprop
 
 # Classifier-Free Guidance (CFG) shape conditioning
-cfg: false
+train_cfg: false
+guidance_method: "cfg" # "cfg", "cg_standard_gradient_wrt_xt", "cg_self_conditioned_gradient_wrt_x0"
+guidance_lambda: 0.01
+guidance_thinking_steps: 1
 cfg_prop: 0.5
 cfg_property: "eigenvalues_and_scale"
 cfg_scale: 1.0
-condition_dim: 4
+use_scale: false
+condition_dim: 3
 
 # distogram specific
-# Set use_distogram to false to completely disable distogram prediction
-use_distogram: true
-distogram_loss_coefficient: 0.1
-distogram_bins: 65
+# Set pair_dist_loss to "none" to completely disable distogram prediction
+pair_dist_loss: "none" # options: "none", "mse", "huber_masked", "distogram" 
+pair_dist_loss_coefficient: 0.1
+distogram_bins: 65 #only used for "distogram"
 distogram_cutoff: 5.12 #roughly the interraction horizon, similar philosophy to alphafold
+distogram_mask_cutoff: 2.0 #relevant only for "huber_masked"
+pair_dist_huber_delta: 1.0 #transition point from L2 to L1 in huber loss
+permutation_invariant_loss: "none" # options: "none",, "sinkhorn"
 
 ablations:
   ablate_s: false
@@ -76,6 +83,7 @@ datamodule:
   train_batch_size: 64
   val_batch_size: 256
   num_val_subset: 2048
+  redraw_val_subset: true
   num_workers: 1
   pin_memory: true
   subset_seed: ${seed}
@@ -83,7 +91,7 @@ datamodule:
 lit_module:
   _target_: src_gmmm.lit.module.LitModule
   cfg_scale: ${cfg_scale}
-  distogram_loss_coefficient: ${distogram_loss_coefficient}
+  pair_dist_loss_coefficient: ${pair_dist_loss_coefficient}
 
   model:
     _target_: src_gmmm.model.diffusion.EquivariantDiffusion
@@ -95,12 +103,19 @@ lit_module:
     n: ${n}
     K: ${K}
     
-    cfg: ${cfg}
+    train_cfg: ${train_cfg}
+    guidance_method: ${guidance_method}
+    guidance_lambda: ${guidance_lambda}
+    guidance_thinking_steps: ${guidance_thinking_steps}
     cfg_prop: ${cfg_prop}
     cfg_property: ${cfg_property}
-    use_distogram: ${use_distogram}
+    use_scale: ${use_scale}
+    pair_dist_loss: ${pair_dist_loss}
     distogram_bins: ${distogram_bins}
     distogram_cutoff: ${distogram_cutoff}
+    distogram_mask_cutoff: ${distogram_mask_cutoff}
+    pair_dist_huber_delta: ${pair_dist_huber_delta}
+    permutation_invariant_loss: ${permutation_invariant_loss}
     
     parameterization:
       _target_: src_gmmm.model.score.EquivariantParameterization
@@ -132,8 +147,6 @@ lit_module:
         num_rbf_features: ${num_rbf_features}
         pred_h: false
         pred_pos: true
-        pred_distogram: ${use_distogram}
-        distogram_bins: ${distogram_bins}
         zero_cog: ${zero_cog}
         parameterization: "residual-time"
 
@@ -182,7 +195,7 @@ callbacks:
     auto_insert_metric_name: true
     save_weights_only: false
     every_n_epochs: ${val_every_n_epochs}
-    save_on_train_epoch_end: true
+    save_on_train_epoch_end: false
 
   representation_tracker:
     _target_: src_gmmm.utils.tracking.RepresentationTrackerCallback
@@ -196,6 +209,7 @@ callbacks:
     dirpath: ${output_dir}/samples
     save_atoms: true
     num_log_wandb: 25
+    atom_type_pairwise_distogram_plots: true
 
 logger:
   wandb:
@@ -211,6 +225,11 @@ logger:
     group: ""
     tags: ${tags}
     job_type: ""
+
+  csv:
+    _target_: pytorch_lightning.loggers.CSVLogger
+    save_dir: ${output_dir}
+    name: "csv_logs"
 
 
 trainer:

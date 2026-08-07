@@ -61,6 +61,7 @@ class GeomDrugsMetrics(Metrics):
         self.smiles = []
         self.valid = []
         self.valid_connected = []
+        self.connected = []
         self.n_atoms = []
         self.total_atoms_with_hs = []
         self.molecule_stable = []
@@ -83,6 +84,7 @@ class GeomDrugsMetrics(Metrics):
 
             v = 0
             c = 0
+            is_connected = 0
             molecule_stable = 0
             atom_stable = 0
             total_atoms = 0
@@ -122,6 +124,8 @@ class GeomDrugsMetrics(Metrics):
                     else:
                         mol_eval = mol
 
+                    is_connected = int(len(Chem.GetMolFrags(mol_eval)) == 1)
+
                     # 4. Use the exact function from isayevlab to determine stability & validity
                     # is_valid already sanitizes and checks for single fragment
                     val, stab, stab_atoms, atom_counts = compute_molecules_stability(
@@ -139,6 +143,7 @@ class GeomDrugsMetrics(Metrics):
                 except Exception:
                     v = 0
                     c = 0
+                    is_connected = 0
                     molecule_stable = 0
                     atom_stable = 0
                     total_atoms = n_heavy
@@ -147,6 +152,7 @@ class GeomDrugsMetrics(Metrics):
             self.smiles.append(smi)
             self.valid.append(v)
             self.valid_connected.append(c)
+            self.connected.append(is_connected)
             self.n_atoms.append(n_heavy)
             self.molecule_stable.append(molecule_stable)
             self.atom_stable.append(atom_stable)
@@ -172,6 +178,7 @@ class GeomDrugsMetrics(Metrics):
         summary["atom_stable"] = sum(self.atom_stable) / max(n_atoms_total, 1)
         summary["molecule_stable"] = sum(self.molecule_stable) / n_samples
         summary["valid_connected"] = sum(self.valid_connected) / n_samples
+        summary["connected"] = sum(self.connected) / n_samples
 
         valid_unique_smiles = set(
             [smiles for (v, smiles) in zip(self.valid, self.smiles) if v and smiles is not None]

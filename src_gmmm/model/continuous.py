@@ -117,7 +117,8 @@ class ContinuousDiffusion(nn.Module):
         index: Optional[torch.Tensor] = None,
         **_,
     ):
-
+        # Variance Preserving (VP-SDE) Euler-Maruyama reverse integration step:
+        # Computes reverse drift and stochastic diffusion term to integrate x_t -> x_{t+dt}
         if self.clamp_pred_in_reverse:
             assert self.parameterization == "x0"
             pred = torch.clamp(pred, *self.clamp_pred_in_reverse)

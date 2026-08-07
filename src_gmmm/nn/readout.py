@@ -30,11 +30,9 @@ class DataPointReadout(Readout):
         h_output_dim: Optional[int] = 0,
         pred_h: bool = True,
         pred_pos: bool = True,
-        pred_distogram: bool = False,
         zero_cog: bool = True,
         parameterization: Literal["residual-pos"] = "residual-pos",
         num_rbf_features: Optional[int] = None,
-        distogram_bins: int = 65,
     ) -> None:
         super(DataPointReadout, self).__init__()
 
@@ -50,17 +48,8 @@ class DataPointReadout(Readout):
             self.net_pos = nn.Linear(in_features=hidden_dim, out_features=1, bias=False)
             self.zero_cog = zero_cog
             
-        if pred_distogram:
-            # The edge embeddings from EquivEncoder have dimension num_rbf_features + 1
-            if num_rbf_features is not None:
-                edge_dim = num_rbf_features + 1
-            else:
-                edge_dim = (hidden_dim // 2) + 1
-            self.net_dist = nn.Linear(edge_dim, distogram_bins)
-
         self.pred_h = pred_h
         self.pred_pos = pred_pos
-        self.pred_distogram = pred_distogram
         self.parameterization = parameterization
 
     def forward(
@@ -74,7 +63,6 @@ class DataPointReadout(Readout):
     ) -> dict[str, torch.Tensor]:
 
         out = dict()
-
         if self.pred_h:
             out["h"] = self.net_h(states["s"])
 
@@ -90,9 +78,4 @@ class DataPointReadout(Readout):
                 out_pos = scatter_center(out_pos, index=node_index)
 
             out["pos"] = out_pos
-            
-        if self.pred_distogram:
-            # We predict the distogram for each edge directly
-            out["dist"] = self.net_dist(states["edge"])
-
         return out

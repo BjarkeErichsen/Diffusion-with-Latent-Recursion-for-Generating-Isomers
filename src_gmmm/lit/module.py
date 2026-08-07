@@ -49,7 +49,7 @@ class LitModule(pl.LightningModule):
         loss_weights: Optional[dict] = None,
         metrics: Optional[Metrics] = None,
         cfg_scale: float = 1.0,
-        distogram_loss_coefficient: float = 0.0,
+        pair_dist_loss_coefficient: float = 0.0,
     ):
         super().__init__()
         self.model = model
@@ -68,8 +68,8 @@ class LitModule(pl.LightningModule):
         self.loss_weights = (
             {"pos": 1.0, "h": 1.0} if loss_weights is None else loss_weights
         )
-        if distogram_loss_coefficient > 0.0:
-            self.loss_weights["dist"] = distogram_loss_coefficient
+        if pair_dist_loss_coefficient > 0.0:
+            self.loss_weights["pairwise"] = pair_dist_loss_coefficient
 
         self.save_hyperparameters(ignore=["model", "metrics"])
 

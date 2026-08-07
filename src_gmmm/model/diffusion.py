@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.data import Batch, Data
 from torch_geometric.utils import to_dense_batch
+from scipy.optimize import linear_sum_assignment
 
 from ..model.continuous import ContinuousDiffusion
 from ..model.score import EquivariantParameterization
@@ -31,10 +32,121 @@ class DistogramLoss(nn.Module):
         # Anything > cutoff goes to the last bin
         target_bins = torch.clamp(target_bins, max=self.num_bins - 1)
         
-        # 3. Compute combined loss
         loss = torch.nn.functional.cross_entropy(preds_dist_edges, target_bins, reduction='mean')
         
         return loss
+
+class MaskedHuberPairwiseLoss(nn.Module):
+    def __init__(self, mask_cutoff: float = 2.0, delta: float = 1.0):
+        super().__init__()
+        self.mask_cutoff = mask_cutoff
+        self.delta = delta
+
+    def forward(self, preds_pos: torch.Tensor, edge_node_index: torch.Tensor, pos: torch.Tensor):
+        u, v = edge_node_index
+        
+        # Calculate pairwise distance of true positions
+        true_dists = torch.norm(pos[u] - pos[v], dim=-1)
+        
+        # Calculate pairwise distance of predicted positions
+        pred_dists = torch.norm(preds_pos[u] - preds_pos[v], dim=-1)
+        
+        # Huber with mask, ignores every loss contribution from an edge whose true pairwise distance is greater than a threshold
+        mask = (true_dists <= self.mask_cutoff).float()
+        
+        # Huber loss on the difference in pairwise distance
+        loss = torch.nn.functional.huber_loss(pred_dists, true_dists, reduction='none', delta=self.delta)
+        
+        # Apply mask
+        loss = (loss * mask).sum() / (mask.sum() + 1e-8)
+        
+        return loss
+
+def compute_eigenvalues_differentiable(pos: torch.Tensor, batch_index: torch.Tensor) -> torch.Tensor:
+    from torch_geometric.utils import to_dense_batch
+    pos_dense, mask = to_dense_batch(pos, batch_index)
+    
+    num_nodes = mask.sum(dim=1, keepdim=True).unsqueeze(-1)
+    mean_pos = (pos_dense * mask.unsqueeze(-1)).sum(dim=1, keepdim=True) / num_nodes
+    
+    pos_centered = (pos_dense - mean_pos) * mask.unsqueeze(-1)
+    covs = torch.bmm(pos_centered.transpose(1, 2), pos_centered)
+    
+    e_unnorm = torch.linalg.eigh(covs).eigenvalues
+    e_unnorm = torch.sort(e_unnorm, descending=True, dim=-1).values
+    
+    e_unnorm = torch.nn.functional.relu(e_unnorm)
+    E = torch.sqrt(e_unnorm + 1e-8)
+    S = E.sum(dim=-1, keepdim=True)
+    S_safe = torch.clamp(S, min=1e-8)
+    s_hat = E / S_safe
+    
+    return torch.cat([s_hat, S], dim=-1)
+
+def grouped_sinkhorn_mse(preds_pos, targets_pos, atom_types, batch_indices, epsilon=0.0033, n_iters=5):
+    """
+    Computes permutation-invariant MSE loss per molecule and per atom type.
+    
+    Dimensionalities:
+    N: Total number of atoms in the entire batch
+    G: Number of unique (molecule, atom_type) groups
+    K: Max number of atoms of the same type in any single molecule
+    """
+    from torch_geometric.utils import to_dense_batch
+    
+    # 1. Create a composite key for (batch_idx, atom_type)
+    # mapped_types in R^N
+    unique_types, mapped_types = torch.unique(atom_types, return_inverse=True)
+    num_types = unique_types.size(0)
+    group_idx = batch_indices * num_types + mapped_types 
+    
+    # 2. Dense batching based strictly on the composite group
+    # pred_dense in R^{G x K x 3}, mask in R^{G x K}
+    pred_dense, mask = to_dense_batch(preds_pos, group_idx)
+    true_dense, _ = to_dense_batch(targets_pos, group_idx)
+    
+    # 3. Pairwise squared distance (MSE cost) isolated within each group
+    # cost in R^{G x K x K}
+    cost = torch.cdist(pred_dense, true_dense, p=2).pow(2)
+    
+    # 4. Valid pairs mask
+    # valid_pairs in R^{G x K x K}. True only if BOTH i and j are real atoms.
+    valid_pairs = mask.unsqueeze(2) & mask.unsqueeze(1)
+    
+    # Block invalid routings (dummy to dummy, real to dummy, etc.)
+    cost_masked = cost.masked_fill(~valid_pairs, 1e9)
+    
+    # 5. Sinkhorn Initialization
+    # K_dist in R^{G x K x K}
+    K_dist = torch.exp(-cost_masked / epsilon)
+    K_dist = K_dist * valid_pairs.float() # Strictly zero out padding
+    
+    # Marginals: Target sums (1 for real atoms, 0 for dummies)
+    # a in R^{G x K x 1}, b in R^{G x 1 x K}
+    a = mask.float().unsqueeze(2)
+    b = mask.float().unsqueeze(1)
+    
+    # Scaling vectors
+    u = torch.ones_like(a)
+    v = torch.ones_like(b)
+    
+    # 6. Sinkhorn Iterations
+    for _ in range(n_iters):
+        # Update u: scale rows to match marginal 'a'
+        u = a / (torch.matmul(K_dist, v.transpose(1, 2)) + 1e-8)
+        # Update v: scale columns to match marginal 'b'
+        v = b / (torch.matmul(u.transpose(1, 2), K_dist) + 1e-8)
+        
+    # 7. Final assignment matrix P in R^{G x K x K}
+    P = u * K_dist * v.transpose(1, 2)
+    
+    # 8. Compute total loss and normalize by valid atoms to match standard MSE scale
+    # We multiply the valid atom count by 3 since each position has 3 coordinates (X, Y, Z).
+    total_loss = torch.sum(P * cost)
+    mean_loss = total_loss / (mask.sum().float() * 3).clamp_min(1.0)
+    
+    return mean_loss
+
 
 class EquivariantDiffusion(nn.Module):
     def __init__(
@@ -47,12 +159,22 @@ class EquivariantDiffusion(nn.Module):
         latent_recursion: bool = False, #latent recursion: whether to use latent recursion
         n: int = 1, #latent recursion: number of latent recursion steps
         K: int = 2, #latent recursion: number of deep recursion steps
-        cfg: bool = False, # classifier-free guidance enabled
+        train_cfg: bool = False, # classifier-free guidance enabled
+        cfg: Optional[bool] = None, # backward compatibility for old configs
+        guidance_method: str = "cfg",
+        guidance_lambda: float = 0.01,
+        guidance_lambda_scale: float = 0.01,
+        guidance_thinking_steps: int = 1,
         cfg_prop: float = 0.5, # probability of replacing condition with null
         cfg_property: str = "eigenvalues_normalized", # property to condition on
-        use_distogram: bool = False, # Whether to predict and compute distogram loss
+        pair_dist_loss: str = "none", # Whether to predict and compute distogram loss
         distogram_bins: int = 65,
         distogram_cutoff: float = 5.12,
+        distogram_mask_cutoff: float = 2.0,
+        pair_dist_huber_delta: float = 1.0,
+        permutation_invariant_loss: str = "none",
+        condition_dim: int = 4,
+        use_scale: bool = False,
     ):
         super().__init__()
 
@@ -66,25 +188,46 @@ class EquivariantDiffusion(nn.Module):
         self.n = n
         self.K = K 
 
-        self.cfg = cfg
+        self.train_cfg = cfg if cfg is not None else train_cfg
+        self.guidance_method = guidance_method
+        self.guidance_lambda = guidance_lambda
+        self.guidance_lambda_scale = guidance_lambda_scale
+        self.guidance_thinking_steps = guidance_thinking_steps
         self.cfg_prop = cfg_prop
         self.cfg_property = cfg_property
-        self.use_distogram = use_distogram
-        self.distogram_loss_fn = DistogramLoss(num_bins=distogram_bins, cutoff=distogram_cutoff)
+        self.pair_dist_loss = pair_dist_loss
+        self.permutation_invariant_loss = permutation_invariant_loss
+        self.use_scale = use_scale
+        if not self.use_scale:
+            condition_dim = 3
+        self.condition_dim = condition_dim
+        self.c_null = nn.Parameter(torch.zeros(self.condition_dim))
+        
+        if self.pair_dist_loss == "huber_masked":
+            self.pairwise_loss_fn = MaskedHuberPairwiseLoss(
+                mask_cutoff=distogram_mask_cutoff,
+                delta=pair_dist_huber_delta
+            )
+        elif self.pair_dist_loss != "none":
+            raise NotImplementedError(f"Distogram loss variant {self.pair_dist_loss} not implemented yet.")
+        else:
+            self.pairwise_loss_fn = None
 
     def loss_diffusion(self, t: torch.Tensor, batch: Batch | Data):
         latents, targets = self.training_targets(t=t, batch=batch)
 
         c = None
-        if self.cfg:
+        if self.train_cfg:
             c = getattr(batch, self.cfg_property, None)
             if c is not None:
                 c = c.view(batch.num_graphs, -1)
+                if not self.use_scale and c.shape[-1] >= 4:
+                    c = c[:, :3]
                 if self.training:
                     # Standard 50/50% conditional/unconditional training
-                    # Replace with zero vector (unconditional) with probability cfg_prop
+                    # Replace with learnable null vector (unconditional) with probability cfg_prop
                     mask = (torch.rand(c.size(0), 1, device=c.device) > self.cfg_prop).float()
-                    c = c * mask
+                    c = c * mask + self.c_null.unsqueeze(0) * (1 - mask)
         
         #self-conditioning: run an inference step without backprop to get previous predictions
         prev_preds = None 
@@ -99,26 +242,24 @@ class EquivariantDiffusion(nn.Module):
                 )
         
         #latent recursion: arbitrary number of recursion steps
-
         z_prev = None
         if self.latent_recursion:
-            skip = torch.rand(1) > self.scprop
-            if not skip: #cold start for BOTH self-conditioning and latent recursion
+            if torch.rand(1) < self.scprop: #cold start for BOTH self-conditioning and latent recursion
                 with torch.no_grad():
                     #deep recursion
                     for k in range(self.K-1):
                         #latent recursion
-                        for i in range(self.n):
-                            preds = self.parameterization.forward(
-                                t=t,
-                                **latents,
-                                node_index=batch.batch,
-                                edge_node_index=batch.edge_node_index,
-                                prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
-                                z_prev=z_prev, #latent recursion: pass previous latent states to the model
-                                c=c,
-                            )
-                            z_prev = preds.get("z", None)
+                        #for i in range(self.n):
+                        #    preds = self.parameterization.forward(
+                        #        t=t,
+                        #        **latents,
+                        #        node_index=batch.batch,
+                        #        edge_node_index=batch.edge_node_index,
+                        #        prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
+                        #        z_prev=z_prev, #latent recursion: pass previous latent states to the model
+                        #        c=c,
+                        #    )
+                        #    z_prev = preds.get("z", None)
                         
                         # Update X1 (prevpreds) and Z, detach
                         preds = self.parameterization.forward(
@@ -152,8 +293,6 @@ class EquivariantDiffusion(nn.Module):
                 prev_preds=prev_preds, z_prev=z_prev, c=c
             )
 
-
-
         else:
             preds = self.parameterization.forward(
                 t=t,
@@ -168,17 +307,25 @@ class EquivariantDiffusion(nn.Module):
         losses = {}
 
         for key in targets:
-            loss = self.diffusions[key].loss_diffusion(
-                preds[key],
-                targets[key],
-                t[batch.batch],  # cast time, when computing node-level property
-                latents[key],
-            )
+            if key == "pos" and self.permutation_invariant_loss == "sinkhorn":
+                loss = grouped_sinkhorn_mse(
+                    preds_pos=preds["pos"],
+                    targets_pos=targets["pos"],
+                    atom_types=batch.h,
+                    batch_indices=batch.batch
+                )
+            else:
+                loss = self.diffusions[key].loss_diffusion(
+                    preds[key],
+                    targets[key],
+                    t[batch.batch],  # cast time, when computing node-level property
+                    latents[key],
+                )
             losses[key] = loss
 
-        if "dist" in preds:
-            losses["dist"] = self.distogram_loss_fn(
-                preds_dist_edges=preds["dist"],
+        if self.pair_dist_loss == "huber_masked" and "pos" in preds:
+            losses["pairwise"] = self.pairwise_loss_fn(
+                preds_pos=preds["pos"],
                 edge_node_index=batch.edge_node_index,
                 pos=batch.pos
             )
@@ -267,13 +414,19 @@ class EquivariantDiffusion(nn.Module):
                 "h": [h_t],
             }
         
-        if self.cfg:
+        if self.guidance_method == "none":
+            c = self.c_null.unsqueeze(0).expand(num_graphs, -1) if self.train_cfg else None
+        elif self.guidance_method in ["CFG", "CG Std", "CG Self", "CG Self CFG-Trick"]:
             if c is None:
                 c = getattr(batch, self.cfg_property, None)
             if c is not None:
                 c = c.view(num_graphs, -1)
+                if not getattr(self, "use_scale", False) and c.shape[-1] >= 4:
+                    c = c[:, :3]
             else:
-                c = torch.zeros((num_graphs, 3), device=device)
+                if not self.training:
+                    raise ValueError(f"Guidance method {self.guidance_method} requires condition `c`, but it was not provided and `batch.{self.cfg_property}` was missing.")
+                c = self.c_null.unsqueeze(0).expand(num_graphs, -1)
         
         prev_preds = None  #self-conditioning: previous predictions
         for i in range(n_steps):
@@ -282,8 +435,64 @@ class EquivariantDiffusion(nn.Module):
 
             t = torch.full((num_graphs, 1), t, device=device)
 
+            x_0_prev_original = prev_preds["pos"].clone().detach() if prev_preds is not None else None
+            
+            if self.guidance_method in ['CG Self', 'CG Self CFG-Trick'] and prev_preds is not None and c is not None:
+                x_0_prev = prev_preds["pos"].clone().detach()
+                for step in range(self.guidance_thinking_steps):
+                    with torch.enable_grad():
+                        x_0_prev = x_0_prev.detach().requires_grad_(True)
+                        y_pred = compute_eigenvalues_differentiable(x_0_prev, node_index)
+                        if getattr(self, "use_scale", False) and c.shape[-1] == 4 and y_pred.shape[-1] == 4:
+                            loss = torch.mean((c[:, :3] - y_pred[:, :3])**2) + getattr(self, "guidance_lambda_scale", 0.01) * torch.mean((c[:, 3] - y_pred[:, 3])**2)
+                        else:
+                            if not getattr(self, "use_scale", False):
+                                loss = torch.mean((c - y_pred[:, :3])**2)
+                            else:
+                                loss = torch.mean((c - y_pred)**2)
+                        grad_x0 = torch.autograd.grad(loss, x_0_prev)[0]
+                        x_0_prev = (x_0_prev - self.guidance_lambda * grad_x0).detach()
+                    
+                    if step < self.guidance_thinking_steps - 1:
+                        temp_prev_preds = prev_preds.copy()
+                        temp_prev_preds["pos"] = x_0_prev
+                        
+                        preds_temp = self.parameterization.forward(
+                            t=t, pos=pos_t, h=h_t, node_index=node_index, 
+                            edge_node_index=edge_node_index, prev_preds=temp_prev_preds, 
+                            z_prev=temp_prev_preds.get("z", None), 
+                            c=self.c_null.unsqueeze(0).expand(num_graphs, -1)
+                        )
+                        x_0_prev = preds_temp["pos"].clone().detach()
+                        
+                if self.guidance_method == 'CG Self':
+                    prev_preds["pos"] = x_0_prev
+                else:
+                    prev_preds["pos_guided"] = x_0_prev
+                    prev_preds["pos_original"] = x_0_prev_original
+            
+            elif self.guidance_method == 'CG Std' and c is not None:
+                for _ in range(self.guidance_thinking_steps):
+                    with torch.enable_grad():
+                        pos_t_in = pos_t.clone().detach().requires_grad_(True)
+                        preds_guidance = self.parameterization.forward(
+                            t=t, pos=pos_t_in, h=h_t, node_index=node_index, 
+                            edge_node_index=edge_node_index, prev_preds=prev_preds, z_prev=prev_preds.get("z", None) if prev_preds else None, c=self.c_null.unsqueeze(0).expand(num_graphs, -1)
+                        )
+                        y_pred = compute_eigenvalues_differentiable(preds_guidance["pos"], node_index)
+                        if getattr(self, "use_scale", False) and c.shape[-1] == 4 and y_pred.shape[-1] == 4:
+                            loss = torch.mean((c[:, :3] - y_pred[:, :3])**2) + getattr(self, "guidance_lambda_scale", 0.01) * torch.mean((c[:, 3] - y_pred[:, 3])**2)
+                        else:
+                            if not getattr(self, "use_scale", False):
+                                loss = torch.mean((c - y_pred[:, :3])**2)
+                            else:
+                                loss = torch.mean((c - y_pred)**2)
+                        grad_xt = torch.autograd.grad(loss, pos_t_in)[0]
+                    pos_t = pos_t - self.guidance_lambda * grad_xt.detach()
+
             #self-conditioning: update previous predictions
             if method == "em":
+                c_for_em = c if self.guidance_method in ["CFG", "none"] else self.c_null.unsqueeze(0).expand(num_graphs, -1)
                 pos_t, h_t, prev_preds = self.reverse_step_em( 
                     t=t,
                     dt=dt,
@@ -292,18 +501,20 @@ class EquivariantDiffusion(nn.Module):
                     node_index=node_index,
                     edge_node_index=edge_node_index,
                     prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
-                    c=c,
+                    c=c_for_em,
                     cfg_scale=cfg_scale,
                 )
             if return_traj:
                 traj["pos"].append(pos_t)
                 traj["h"].append(h_t)
+                if "preds_pos" not in traj:
+                    traj["preds_pos"] = []
+                traj["preds_pos"].append(prev_preds["pos"])
 
         samples = {
             "pos": pos_t,
             "h": h_t,
         }
-
 
         if return_traj:
             return samples, traj
@@ -328,22 +539,35 @@ class EquivariantDiffusion(nn.Module):
         z_prev = prev_preds.get("z", None) if prev_preds is not None else None
         
         if self.latent_recursion:
-            for i in range(self.n):
-                preds = self.parameterization.forward(
-                    t=t,
-                    pos=pos_t,
-                    h=h_t,
-                    node_index=node_index,
-                    edge_node_index=edge_node_index,
-                    prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
-                    z_prev=z_prev, #latent recursion: pass previous latent states to the model
-                    c=c,
-                )
-                z_prev = preds.get("z", None)
+            #for i in range(self.n):
+            preds = self.parameterization.forward(
+                t=t,
+                pos=pos_t,
+                h=h_t,
+                node_index=node_index,
+                edge_node_index=edge_node_index,
+                prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
+                z_prev=z_prev, #latent recursion: pass previous latent states to the model
+                c=c,
+            )
+            #z_prev = preds.get("z", None)
         
+        
+        else:
+            preds = self.parameterization.forward(
+                t=t,
+                pos=pos_t,
+                h=h_t,
+                node_index=node_index,
+                edge_node_index=edge_node_index,
+                prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
+                z_prev=z_prev, #latent recursion: pass previous latent states to the model
+                c=c,
+            )
+
         # get NN predictions
-        if self.cfg and c is not None:
-            c_null = torch.zeros_like(c)
+        if self.guidance_method == "CFG" and c is not None:
+            c_null = self.c_null.unsqueeze(0).expand(c.size(0), -1)
             preds_uncond = self.parameterization.forward(
                 t=t,
                 pos=pos_t,
@@ -372,19 +596,47 @@ class EquivariantDiffusion(nn.Module):
                     preds[key] = preds_uncond[key] + cfg_scale * (preds_cond[key] - preds_uncond[key])
                 else:
                     preds[key] = preds_cond[key]
-        else:
-            preds = self.parameterization.forward(
+        elif self.guidance_method == "CG Self CFG-Trick" and prev_preds is not None and c is not None:
+            prev_preds_guided = prev_preds.copy()
+            prev_preds_guided["pos"] = prev_preds["pos_guided"]
+            
+            prev_preds_unguid = prev_preds.copy()
+            prev_preds_unguid["pos"] = prev_preds["pos_original"]
+            
+            c_null = self.c_null.unsqueeze(0).expand(c.size(0), -1)
+            
+            preds_unguid = self.parameterization.forward(
                 t=t,
                 pos=pos_t,
                 h=h_t,
                 node_index=node_index,
                 edge_node_index=edge_node_index,
-                prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
-                z_prev=z_prev, #latent recursion: pass previous latent states to the model
-                c=c,
+                prev_preds=prev_preds_unguid,
+                z_prev=z_prev,
+                c=c_null,
             )
+            
+            preds_guided = self.parameterization.forward(
+                t=t,
+                pos=pos_t,
+                h=h_t,
+                node_index=node_index,
+                edge_node_index=edge_node_index,
+                prev_preds=prev_preds_guided,
+                z_prev=z_prev,
+                c=c_null,
+            )
+            
+            preds = {}
+            for key in preds_guided:
+                if key == "z":
+                    preds[key] = preds_guided[key]
+                elif isinstance(preds_guided[key], torch.Tensor):
+                    preds[key] = preds_unguid[key] + cfg_scale * (preds_guided[key] - preds_unguid[key])
+                else:
+                    preds[key] = preds_guided[key]
 
-        # reverse step on each modality
+        # Variance Preserving (VP-SDE) Euler-Maruyama integration step on each modality
         if self.diffusion_pos:
             pos_t = self.diffusion_pos.reverse_step(
                 t=t[node_index], x_t=pos_t, pred=preds["pos"], dt=dt, index=node_index
