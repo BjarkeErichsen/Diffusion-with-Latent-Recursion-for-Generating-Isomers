@@ -27,8 +27,10 @@ max_distance: 12.0 # QM9-specific
 parameterization: "x0"
 
 # TRM / self-cond specific
-self_conditioning: true        #self-conditioning: whether to use self-conditioning 
-latent_recursion: true  #latent-recursion: whether to use latent recursion (ASSUMES self-conditioning == True)
+self_conditioning: false        #self-conditioning: whether to use self-conditioning 
+latent_recursion: "none" 
+latent_recursion_training_method: "standard" # "standard", "one_forward_one_back", "mimick_inference_bpt_integrator", "mimick_inference_loss_at_each_timestep"
+n_integration_steps: 250
 update_edge_states: false #update edge states
 n: 1 #latent-recursion: REQUIREMENT n>=0, number of latent recursion steps
 K: 2 #deep-recursion: REQUIREMENT K>=2,number of deep recursion steps 
@@ -100,6 +102,8 @@ lit_module:
     scprop: ${scprop}         #self-conditioning: probability of using self-conditioning (ONLY used when self_conditioning is true)
     self_conditioning: ${self_conditioning}
     latent_recursion: ${latent_recursion}
+    latent_recursion_training_method: ${latent_recursion_training_method}
+    n_integration_steps: ${n_integration_steps}
     n: ${n}
     K: ${K}
     
@@ -171,8 +175,9 @@ lit_module:
 
 
 
-  n_integration_steps: 250
+  n_integration_steps: ${n_integration_steps}
   lr: 2e-4
+  log_grad_freq: 50
   warm_up_steps: 100
   with_ema: true
   ema_start_step: 500

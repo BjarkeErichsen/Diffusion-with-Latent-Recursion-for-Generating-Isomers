@@ -90,6 +90,7 @@ class ContinuousDiffusion(nn.Module):
         *args: Optional[Any],
     ):
         assert pred.shape == target.shape
+        # ACTUAL LOSS CALCULATION IS HERE: Mean Squared Error (MSE) between prediction and target
         return F.mse_loss(pred, target)
 
     def training_targets(self, t: torch.Tensor, x: torch.Tensor, index: torch.Tensor):
@@ -107,8 +108,22 @@ class ContinuousDiffusion(nn.Module):
 
         return x_t, target
 
-    @torch.inference_mode()
     def reverse_step(
+        self,
+        t: torch.Tensor,
+        x_t: torch.Tensor,
+        pred: torch.Tensor,
+        dt: torch.Tensor,
+        index: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        if not torch.is_grad_enabled():
+            with torch.inference_mode():
+                return self._reverse_step_impl(t, x_t, pred, dt, index, **kwargs)
+        else:
+            return self._reverse_step_impl(t, x_t, pred, dt, index, **kwargs)
+
+    def _reverse_step_impl(
         self,
         t: torch.Tensor,
         x_t: torch.Tensor,

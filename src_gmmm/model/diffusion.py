@@ -142,6 +142,7 @@ def grouped_sinkhorn_mse(preds_pos, targets_pos, atom_types, batch_indices, epsi
     
     # 8. Compute total loss and normalize by valid atoms to match standard MSE scale
     # We multiply the valid atom count by 3 since each position has 3 coordinates (X, Y, Z).
+    # ACTUAL SINKHORN LOSS CALCULATION IS HERE
     total_loss = torch.sum(P * cost)
     mean_loss = total_loss / (mask.sum().float() * 3).clamp_min(1.0)
     
@@ -157,8 +158,10 @@ class EquivariantDiffusion(nn.Module):
         self_conditioning: bool = False, #self-conditioning: whether to use self-conditioning
         scprop: float = 0.9,  #self-conditioning: probability of using self-conditioning
         latent_recursion: bool = False, #latent recursion: whether to use latent recursion
+        latent_recursion_training_method: str = "standard", # latent recursion training method
         n: int = 1, #latent recursion: number of latent recursion steps
         K: int = 2, #latent recursion: number of deep recursion steps
+        n_integration_steps: int = 250, # number of integration steps used in mimick inference training schedule
         train_cfg: bool = False, # classifier-free guidance enabled
         cfg: Optional[bool] = None, # backward compatibility for old configs
         guidance_method: str = "cfg",
@@ -179,14 +182,16 @@ class EquivariantDiffusion(nn.Module):
         super().__init__()
 
         self.parameterization = parameterization
-        self.diffusions = nn.ModuleDict({"pos": diffusion_pos, "h": diffusion_h})
+        self.diffusions = nn.ModuleDict({"pos": diffusion_pos, "h": diffusion_h}) 
 
         self.self_conditioning = self_conditioning #self-conditioning: whether to use self-conditioning
         self.scprop = scprop #self-conditioning: probability of using self-conditioning
 
         self.latent_recursion = latent_recursion
+        self.latent_recursion_training_method = latent_recursion_training_method
         self.n = n
         self.K = K 
+        self.n_integration_steps = n_integration_steps
 
         self.train_cfg = cfg if cfg is not None else train_cfg
         self.guidance_method = guidance_method
@@ -213,97 +218,14 @@ class EquivariantDiffusion(nn.Module):
         else:
             self.pairwise_loss_fn = None
 
-    def loss_diffusion(self, t: torch.Tensor, batch: Batch | Data):
-        latents, targets = self.training_targets(t=t, batch=batch)
-
-        c = None
-        if self.train_cfg:
-            c = getattr(batch, self.cfg_property, None)
-            if c is not None:
-                c = c.view(batch.num_graphs, -1)
-                if not self.use_scale and c.shape[-1] >= 4:
-                    c = c[:, :3]
-                if self.training:
-                    # Standard 50/50% conditional/unconditional training
-                    # Replace with learnable null vector (unconditional) with probability cfg_prop
-                    mask = (torch.rand(c.size(0), 1, device=c.device) > self.cfg_prop).float()
-                    c = c * mask + self.c_null.unsqueeze(0) * (1 - mask)
-        
-        #self-conditioning: run an inference step without backprop to get previous predictions
-        prev_preds = None 
-        if self.self_conditioning and not self.latent_recursion and torch.rand(1) < self.scprop:
-            with torch.no_grad():
-                prev_preds = self.parameterization.forward(
-                    t=t,
-                    **latents,
-                    node_index=batch.batch,
-                    edge_node_index=batch.edge_node_index,
-                    c=c,
-                )
-        
-        #latent recursion: arbitrary number of recursion steps
-        z_prev = None
-        if self.latent_recursion:
-            if torch.rand(1) < self.scprop: #cold start for BOTH self-conditioning and latent recursion
-                with torch.no_grad():
-                    #deep recursion
-                    for k in range(self.K-1):
-                        #latent recursion
-                        #for i in range(self.n):
-                        #    preds = self.parameterization.forward(
-                        #        t=t,
-                        #        **latents,
-                        #        node_index=batch.batch,
-                        #        edge_node_index=batch.edge_node_index,
-                        #        prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
-                        #        z_prev=z_prev, #latent recursion: pass previous latent states to the model
-                        #        c=c,
-                        #    )
-                        #    z_prev = preds.get("z", None)
-                        
-                        # Update X1 (prevpreds) and Z, detach
-                        preds = self.parameterization.forward(
-                            t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
-                            prev_preds=prev_preds, z_prev=z_prev, c=c
-                        )
-                        z_prev = preds.get("z", None)
-                        if not z_prev is None:
-                            if isinstance(z_prev, list):
-                                z_prev = [z.detach() for z in z_prev]
-                            else:
-                                z_prev = z_prev.detach()
-
-                        if self.self_conditioning:
-                            prev_preds = {k: v.detach() for k, v in preds.items() if k != "z"} #just copy
-
-                    
-                        
-            # Run final iteration with tracking
-            for i in range(self.n):
-                #if skip:
-                #    continue
-                preds = self.parameterization.forward(
-                    t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
-                    prev_preds=prev_preds, z_prev=z_prev, c=c
-                )
-                z_prev = preds.get("z", None)
-            
-            preds = self.parameterization.forward(
-                t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
-                prev_preds=prev_preds, z_prev=z_prev, c=c
-            )
-
-        else:
-            preds = self.parameterization.forward(
-                t=t,
-                **latents,
-                node_index=batch.batch,
-                edge_node_index=batch.edge_node_index,
-                prev_preds=prev_preds, #self-conditioning: pass previous predictions to the model
-                z_prev=z_prev, #latent recursion: pass previous latent states to the model
-                c=c,
-            )
-
+    def _compute_losses(
+        self,
+        preds: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+        latents: dict[str, torch.Tensor],
+        t: torch.Tensor,
+        batch: Batch | Data,
+    ) -> dict[str, torch.Tensor]:
         losses = {}
 
         for key in targets:
@@ -331,6 +253,189 @@ class EquivariantDiffusion(nn.Module):
             )
 
         return losses
+
+    def loss_diffusion(self, t: torch.Tensor, batch: Batch | Data):
+        latents, targets = self.training_targets(t=t, batch=batch)
+
+        c = None
+        if self.train_cfg:
+            c = getattr(batch, self.cfg_property, None)
+            if c is not None:
+                c = c.view(batch.num_graphs, -1)
+                if not self.use_scale and c.shape[-1] >= 4:
+                    c = c[:, :3]
+                if self.training:
+                    # Standard 50/50% conditional/unconditional training
+                    # Replace with learnable null vector (unconditional) with probability cfg_prop
+                    mask = (torch.rand(c.size(0), 1, device=c.device) > self.cfg_prop).float()
+                    c = c * mask + self.c_null.unsqueeze(0) * (1 - mask)
+        
+        #self-conditioning: run an inference step without backprop to get previous predictions
+        prev_preds = None 
+        if self.self_conditioning and torch.rand(1) < self.scprop:
+            with torch.no_grad():
+                prev_preds = self.parameterization.forward(
+                    t=t,
+                    **latents,
+                    node_index=batch.batch,
+                    edge_node_index=batch.edge_node_index,
+                    c=c,
+                )
+        
+        #latent recursion: arbitrary number of recursion steps
+        z_prev = None
+        if self.latent_recursion:
+            if torch.rand(1) < self.scprop: #cold start for BOTH self-conditioning and latent recursion
+                with torch.no_grad():
+                    #deep recursion
+                    for k in range(self.K-1):
+                        preds = self.parameterization.forward(
+                            t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                            prev_preds=prev_preds, z_prev=z_prev, c=c
+                        )
+                        z_prev = preds.get("z", None)
+                        if not z_prev is None:
+                            if isinstance(z_prev, list):
+                                z_prev = [z.detach() for z in z_prev]
+                            else:
+                                z_prev = z_prev.detach()
+
+                        if self.self_conditioning:
+                            prev_preds = {k: v.detach() for k, v in preds.items() if k != "z"} #just copy
+
+        # Execute training loop according to latent_recursion_training_method
+        if not self.latent_recursion:
+            preds = self.parameterization.forward(
+                t=t,
+                **latents,
+                node_index=batch.batch,
+                edge_node_index=batch.edge_node_index,
+                prev_preds=prev_preds,
+                z_prev=z_prev,
+                c=c,
+            )
+            return self._compute_losses(preds, targets, latents, t, batch)
+
+        elif self.latent_recursion_training_method == "standard":
+            for i in range(self.n):
+                preds = self.parameterization.forward(
+                    t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                    prev_preds=prev_preds, z_prev=z_prev, c=c
+                )
+                z_prev = preds.get("z", None)
+                if self.self_conditioning:
+                    prev_preds = {k: v for k, v in preds.items() if k != "z"}
+
+            preds = self.parameterization.forward(
+                t=t, **latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                prev_preds=prev_preds, z_prev=z_prev, c=c
+            )
+            return self._compute_losses(preds, targets, latents, t, batch)
+
+        elif self.latent_recursion_training_method == "mimick_inference":
+            dt = torch.full_like(t, -(1.0 - 1e-3) / self.n_integration_steps)
+            current_t = t.clone()
+            current_latents = {k: v.clone() for k, v in latents.items()}
+
+            for i in range(self.n):
+                preds = self.parameterization.forward(
+                    t=current_t, **current_latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                    prev_preds=prev_preds, z_prev=z_prev, c=c
+                )
+                z_prev = preds.get("z", None)
+                prev_preds = {k: v for k, v in preds.items() if k != "z"}
+
+                with torch.no_grad():
+                    pos_integrated = self.diffusions["pos"].reverse_step(
+                        t=current_t[batch.batch],
+                        x_t=current_latents["pos"],
+                        pred=preds["pos"],
+                        dt=dt[batch.batch],
+                        index=batch.batch,
+                    )
+                current_latents["pos"] = pos_integrated.detach()
+
+                current_t = torch.clamp(current_t + dt, min=1e-3)
+
+            preds = self.parameterization.forward(
+                t=current_t, **current_latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                prev_preds=prev_preds, z_prev=z_prev, c=c
+            )
+            return self._compute_losses(preds, targets, current_latents, current_t, batch)
+
+        elif self.latent_recursion_training_method == "mimick_inference_bpt_integrator":
+            dt = torch.full_like(t, -(1.0 - 1e-3) / self.n_integration_steps)
+            current_t = t.clone()
+            current_latents = {k: v.clone() for k, v in latents.items()}
+
+            for i in range(self.n):
+                preds = self.parameterization.forward(
+                    t=current_t, **current_latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                    prev_preds=prev_preds, z_prev=z_prev, c=c
+                )
+                z_prev = preds.get("z", None)
+                prev_preds = {k: v for k, v in preds.items() if k != "z"}
+
+                pos_integrated = self.diffusions["pos"].reverse_step(
+                    t=current_t[batch.batch],
+                    x_t=current_latents["pos"],
+                    pred=preds["pos"],
+                    dt=dt[batch.batch],
+                    index=batch.batch,
+                )
+                current_latents["pos"] = pos_integrated
+
+                current_t = torch.clamp(current_t + dt, min=1e-3)
+
+            preds = self.parameterization.forward(
+                t=current_t, **current_latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                prev_preds=prev_preds, z_prev=z_prev, c=c
+            )
+            return self._compute_losses(preds, targets, current_latents, current_t, batch)
+
+        elif self.latent_recursion_training_method == "mimick_inference_loss_at_each_timestep":
+            dt = torch.full_like(t, -(1.0 - 1e-3) / self.n_integration_steps)
+            current_t = t.clone()
+            current_latents = {k: v.clone() for k, v in latents.items()}
+            all_step_losses = []
+
+            for i in range(self.n + 1):
+                preds = self.parameterization.forward(
+                    t=current_t, **current_latents, node_index=batch.batch, edge_node_index=batch.edge_node_index,
+                    prev_preds=prev_preds, z_prev=z_prev, c=c
+                )
+                step_losses = self._compute_losses(preds, targets, current_latents, current_t, batch)
+                all_step_losses.append(step_losses)
+
+                if i < self.n:
+                    z_prev = preds.get("z", None)
+                    if z_prev is not None:
+                        if isinstance(z_prev, list):
+                            z_prev = [z.detach() for z in z_prev]
+                        else:
+                            z_prev = z_prev.detach()
+
+                    prev_preds = {k: v.detach() for k, v in preds.items() if k != "z"}
+
+                    with torch.no_grad():
+                        pos_integrated = self.diffusions["pos"].reverse_step(
+                            t=current_t[batch.batch],
+                            x_t=current_latents["pos"],
+                            pred=preds["pos"],
+                            dt=dt[batch.batch],
+                            index=batch.batch,
+                        )
+                    current_latents["pos"] = pos_integrated.detach()
+
+                    current_t = torch.clamp(current_t + dt, min=1e-3)
+
+            losses = {}
+            for key in all_step_losses[0]:
+                losses[key] = torch.stack([step[key] for step in all_step_losses]).mean()
+            return losses
+
+        else:
+            raise ValueError(f"Unknown latent_recursion_training_method: '{self.latent_recursion_training_method}'")
 
     def training_targets(
         self, t: torch.Tensor, batch: Batch | Data
@@ -383,7 +488,7 @@ class EquivariantDiffusion(nn.Module):
 
         return pos, h
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def sample(
         self,
         batch: Batch | Data,

@@ -50,6 +50,7 @@ class LitModule(pl.LightningModule):
         metrics: Optional[Metrics] = None,
         cfg_scale: float = 1.0,
         pair_dist_loss_coefficient: float = 0.0,
+        log_grad_freq: int = 50,
     ):
         super().__init__()
         self.model = model
@@ -64,6 +65,7 @@ class LitModule(pl.LightningModule):
         self.decoder = decoder
 
         self.metrics = metrics
+        self._params_before_step = None
 
         self.loss_weights = (
             {"pos": 1.0, "h": 1.0} if loss_weights is None else loss_weights
@@ -113,7 +115,63 @@ class LitModule(pl.LightningModule):
 
         return loss
 
+    def on_before_optimizer_step(self, optimizer, *args, **kwargs):
+        log_grad_freq = getattr(self.hparams, "log_grad_freq", 50)
+        if log_grad_freq > 0 and self.global_step % log_grad_freq == 0:
+            params = [p for p in self.parameters() if p.grad is not None]
+            if params:
+                # 1. Global L2 Norm
+                grad_l2_norm = torch.norm(
+                    torch.stack([p.grad.detach().norm(2) for p in params]), 2
+                )
+                # 2. Mean Absolute Gradient
+                total_abs_sum = sum(p.grad.detach().abs().sum() for p in params)
+                total_numel = sum(p.grad.numel() for p in params)
+                grad_mean_abs = total_abs_sum / total_numel
+                # 3. Max Absolute Gradient
+                grad_max_abs = max(p.grad.detach().abs().max() for p in params)
+
+                self.log_dict(
+                    {
+                        "train/grad_l2_norm": grad_l2_norm,
+                        "train/grad_mean_abs": grad_mean_abs,
+                        "train/grad_max_abs": grad_max_abs,
+                    },
+                    on_step=True,
+                    on_epoch=False,
+                )
+
+                # Snapshot parameters to calculate update ratio after optimizer step
+                self._params_before_step = {
+                    name: p.detach().clone()
+                    for name, p in self.named_parameters()
+                    if p.requires_grad
+                }
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
+        if hasattr(self, "_params_before_step") and self._params_before_step is not None:
+            sq_diff_sum = torch.tensor(0.0, device=self.device)
+            sq_param_sum = torch.tensor(0.0, device=self.device)
+
+            for name, p in self.named_parameters():
+                if name in self._params_before_step:
+                    old_p = self._params_before_step[name]
+                    sq_diff_sum += (p.detach() - old_p).pow(2).sum()
+                    sq_param_sum += old_p.pow(2).sum()
+
+            update_l2_norm = torch.sqrt(sq_diff_sum)
+            param_l2_norm = torch.sqrt(sq_param_sum)
+            update_param_ratio = update_l2_norm / (param_l2_norm + 1e-8)
+
+            self.log(
+                "train/update_param_ratio",
+                update_param_ratio,
+                on_step=True,
+                on_epoch=False,
+            )
+
+            self._params_before_step = None
+
         if self.model_ema is not None:
             if self.global_step >= self.hparams.ema_start_step:
                 self.model_ema.update_parameters(self.model)
@@ -170,7 +228,7 @@ class LitModule(pl.LightningModule):
     def on_test_epoch_end(self):
         self.compute_and_log_metrics(stage="test")
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def sample(self, batch, ema: bool = True, batch_idx: int = 0) -> list[ase.Atoms]:
         model = self.get_model(ema=ema)
         ptr = batch.ptr
