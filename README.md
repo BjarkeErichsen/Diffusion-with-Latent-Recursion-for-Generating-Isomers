@@ -91,6 +91,6 @@ The diffusion model denoises 3D coordinates and atom types over a continuous tim
 
 | Denoising Animation | True Molecule |
 | :---: | :---: |
-| ![Denoising Animation](evals/denoising_animation.gif) | ![True Molecule](evals/true_molecule.png) |
+| <img src="denoising_animation.gif" width="450"> | <img src="true_molecule.png" width="450"> |
 
 *(Generated via `scripts/animate_denoising.py`)*
