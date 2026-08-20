@@ -551,6 +551,7 @@ class LatentRecursionLayer(nn.Module):
             "edge_v_v_scaled_s_normed",
             "edge_v_norm_then_proj_s_v",
             "edge_v_update_s_v",
+            "edge_mlp_update_s_v_identity",
             "edge_v_proj_s_proj",
             "true",
         ):
@@ -683,6 +684,24 @@ class LatentRecursionLayer(nn.Module):
             edge_residual = edge_states - edge_from_v
             edge_states = edge_states + self.edge_mlp(torch.cat([edge_states, edge_residual], dim=-1))
 
+        elif self.method in ("edge_v_update_s_v", "true"):
+            ### edge from v AND update layer
+            delta_s, delta_v = self.update_lr(lr_s, lr_v, skip_residual=True)
+            node_states_s = node_states_s + delta_s
+            node_states_v = node_states_v + delta_v
+
+            dest, source = edge_node_index
+            v_dest = lr_v[dest]
+            v_src = lr_v[source]
+            distances = torch.norm(v_dest - v_src, dim=1)
+            cos_sim = F.cosine_similarity(v_dest, v_src, dim=1)
+            v_geom_features = torch.cat([distances, cos_sim], dim=-1)
+            edge_from_v = self.v_to_edge_mlp(v_geom_features)
+            edge_residual = edge_states - edge_from_v
+            edge_states = edge_states + self.edge_mlp(torch.cat([edge_states, edge_residual], dim=-1))
+
+
+
         elif self.method == "edge_v_v_scaled_s_normed":
             ### edge from v AND v scaled mapping s normed
             node_states_v = self.v_norm(lr_v)
@@ -715,27 +734,29 @@ class LatentRecursionLayer(nn.Module):
             edge_update = self.edge_mlp(torch.cat([edge_states, edge_residual], dim=-1))
             edge_states = edge_states + self.e_norm(edge_update)
 
-        elif self.method in ("edge_v_update_s_v", "true"):
-            ### edge from v AND update layer
-            delta_s, delta_v = self.update_lr(lr_s, lr_v, skip_residual=True)
-            node_states_s = node_states_s + delta_s
-            node_states_v = node_states_v + delta_v
-
-            dest, source = edge_node_index
-            v_dest = lr_v[dest]
-            v_src = lr_v[source]
-            distances = torch.norm(v_dest - v_src, dim=1)
-            cos_sim = F.cosine_similarity(v_dest, v_src, dim=1)
-            v_geom_features = torch.cat([distances, cos_sim], dim=-1)
-            edge_from_v = self.v_to_edge_mlp(v_geom_features)
-            edge_residual = edge_states - edge_from_v
-            edge_states = edge_states + self.edge_mlp(torch.cat([edge_states, edge_residual], dim=-1))
-
         elif self.method == "edge_v_proj_s_proj":
             ### edge from v AND v proj mapping s proj
             node_states_v = lr_v
             node_states_s = node_states_s + lr_s
             dest, source = edge_node_index
+            v_dest = lr_v[dest]
+            v_src = lr_v[source]
+            v_diff = v_dest - v_src
+            distances = torch.sqrt(torch.sum(v_diff ** 2, dim=1) + 1e-8)
+            cos_sim = F.cosine_similarity(v_dest, v_src, dim=1)
+            v_geom_features = torch.cat([distances, cos_sim], dim=-1)
+            edge_from_v = self.v_to_edge_mlp(v_geom_features)
+            edge_residual = edge_states - edge_from_v
+            edge_update = self.edge_mlp(torch.cat([edge_states, edge_residual], dim=-1))
+            edge_states = edge_states + edge_update
+
+        elif self.method == "edge_mlp_update_s_v_identity":
+            ### Descriptive name: Updates edge states using geometric features (distance, cos_sim) 
+            ### extracted from vector latent recursion (lr_v), while applying identity to node states.
+            node_states_v = lr_v
+            node_states_s = node_states_s + lr_s
+            dest, source = edge_node_index
+
             v_dest = lr_v[dest]
             v_src = lr_v[source]
             v_diff = v_dest - v_src
